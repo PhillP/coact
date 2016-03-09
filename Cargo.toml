@@ -1,0 +1,4 @@
+[package]
+name = "coact"
+version = "0.1.0"
+authors = ["Phillip Pettit"]
