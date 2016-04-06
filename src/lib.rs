@@ -3,6 +3,106 @@ use std::sync::mpsc::{Sender, Receiver, RecvError, SendError, TryRecvError};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::thread::{JoinHandle};
+use std::marker::PhantomData;
+
+pub struct Pipe<I,O: 'static> {
+    out_connecter: Arc<Mutex<Connector<O>>>,
+    inner_transform: fn(I) -> O
+}
+
+unsafe impl<I,O> Send for Pipe<I,O> {}
+unsafe impl<O> Send for Connector<O> {}
+
+pub enum Connector<T> {
+    SynchronousConnector {
+        pipe: Arc<Mutex<Processor<T>>>
+    },
+    AsynchronousConnector {
+        pipe: Arc<Mutex<Processor<T> + Send>>,
+        sender : Arc<Mutex<Sender<T>>>,
+        receiver : Arc<Mutex<Receiver<T>>>,
+        thread_handle: JoinHandle<()>
+    },
+    DoNothingConnector
+}
+
+impl<I: 'static + Send> Connector<I> {
+    pub fn sync_connector(pipe: Arc<Mutex<Processor<I>>>) -> Connector<I> {
+        Connector::<I>::SynchronousConnector {
+            pipe: pipe
+        }
+    }
+    
+    pub fn async_connector(pipe: Arc<Mutex<Processor<I> + Send>>) -> Connector<I> {
+        let (tx, rx) = channel::<I>();
+        
+        let txarc = Arc::new(Mutex::new(tx));
+        let rxarc = Arc::new(Mutex::new(rx));
+        
+        let pipearc_clone = pipe.clone();
+        let rxarc_clone = rxarc.clone();
+        
+        Connector::AsynchronousConnector {
+            pipe: pipe,
+            sender: txarc,
+            receiver: rxarc,
+            thread_handle: thread::spawn(move || {
+                while(true) {
+                    let result = rxarc_clone.lock().unwrap().recv();
+        
+                    if result.is_ok() {
+                        pipearc_clone.lock().unwrap().process(result.ok().unwrap());
+                    }
+                }                        
+            }) 
+        }
+    }
+}
+
+impl<I: 'static + Send, O: 'static> Pipe<I, O> {
+    pub fn new(transform: fn(I) -> O) -> Pipe<I, O> {
+        let dnc = Connector::DoNothingConnector;
+        Pipe::<I,O>::new_with_connector(transform, dnc)
+    }
+    
+    pub fn new_with_connector(transform: fn(I) -> O, connector: Connector<O>) -> Pipe<I, O> {
+        Pipe {
+            out_connecter: Arc::new(Mutex::new(connector)),
+            inner_transform: transform
+        }
+    }
+
+    pub fn connect(&mut self, connector: Connector<O>) {
+        self.out_connecter = Arc::new(Mutex::new(connector));
+    }
+}
+
+pub trait Processor<T> {
+    fn process(&self, T) -> ();
+}
+
+impl<I, O> Processor<I> for Pipe<I, O> {
+    fn process(&self, data: I) -> () {
+        let output = (self.inner_transform)(data);
+        self.out_connecter.lock().unwrap().process(output)
+    }
+}
+
+impl<T> Processor<T> for Connector<T> {
+    fn process(&self, data: T) -> () {
+        match *self {
+            Connector::DoNothingConnector => (),
+            Connector::SynchronousConnector { pipe: ref pipe } => pipe.lock().unwrap().process(data),
+            Connector::AsynchronousConnector {
+                pipe: ref pipe,
+                sender : ref sender,
+                receiver : ref receiver,
+                thread_handle: ref thread_handle
+            }   =>  { sender.lock().unwrap().send(data); },
+        }
+    }
+}
 
 /// Represents a pair of channels used for bi-directional communication.
 /// T1 represents the type of data sent in one direction
@@ -239,6 +339,37 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
+    
+    fn double(i:i64) -> i64 {
+        println!("double");
+        format!("Value before double is: {}",i);
+        i*2
+    }
+    fn triple(i:i64) -> i64 {
+        println!("triple");
+        format!("Value before triple is: {}",i);
+        i*3
+    }
+    
+    #[test]
+    fn pipe() {
+        println!("starting");
+        // create a Pipe
+        let mut double_pipe = Arc::new(Mutex::new(Pipe::new(double)));
+        let mut triple_pipe = Arc::new(Mutex::new(Pipe::new(triple)));
+        let mut second_double_pipe = Arc::new(Mutex::new(Pipe::new(double)));
+        
+        let val:i64 = 50;
+        
+        let connector1 = Connector::<i64>::sync_connector(triple_pipe.clone());
+        let connector2 = Connector::<i64>::sync_connector(second_double_pipe.clone());
+        // connect the pipes
+        double_pipe.lock().unwrap().connect(connector1);
+        triple_pipe.lock().unwrap().connect(connector2);
+           
+        double_pipe.lock().unwrap().process(val);
+    }
+    
     #[test]
     fn coordinate_via_bidirectional() {
        
