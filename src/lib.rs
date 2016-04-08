@@ -6,12 +6,13 @@ use std::thread;
 use std::thread::{JoinHandle};
 use std::marker::PhantomData;
 
-pub struct Pipe<I,O: 'static> {
-    out_connecter: Arc<Mutex<Connector<O>>>,
-    inner_transform: fn(I) -> O
+pub struct Pipe<I,O: 'static, T> where T: Fn(I) -> O, O: Clone  {
+    out_connectors: Arc<Mutex<Vec<Connector<O>>>>,
+    inner_transform: T,
+    _marker: PhantomData<I>  
 }
 
-unsafe impl<I,O> Send for Pipe<I,O> {}
+unsafe impl<I,O,T> Send for Pipe<I,O,T> where T: Fn(I) -> O, O: Clone {}
 unsafe impl<O> Send for Connector<O> {}
 
 pub enum Connector<T> {
@@ -60,21 +61,24 @@ impl<I: 'static + Send> Connector<I> {
     }
 }
 
-impl<I: 'static + Send, O: 'static> Pipe<I, O> {
-    pub fn new(transform: fn(I) -> O) -> Pipe<I, O> {
-        let dnc = Connector::DoNothingConnector;
-        Pipe::<I,O>::new_with_connector(transform, dnc)
+impl<I: 'static + Send, O: 'static, T> Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
+    pub fn new(transform: T) -> Pipe<I, O, T> {
+        Pipe {
+            out_connectors: Arc::new(Mutex::new(Vec::new())),
+            inner_transform: transform,
+            _marker: PhantomData
+        }
     }
     
-    pub fn new_with_connector(transform: fn(I) -> O, connector: Connector<O>) -> Pipe<I, O> {
-        Pipe {
-            out_connecter: Arc::new(Mutex::new(connector)),
-            inner_transform: transform
-        }
+    pub fn new_with_connector(transform: T, connector: Connector<O>) -> Pipe<I, O, T> {
+        let newPipe = Pipe::<I, O, T>::new(transform);
+        
+        newPipe.out_connectors.lock().unwrap().push(connector);
+        newPipe
     }
 
     pub fn connect(&mut self, connector: Connector<O>) {
-        self.out_connecter = Arc::new(Mutex::new(connector));
+        self.out_connectors.lock().unwrap().push(connector);
     }
 }
 
@@ -82,10 +86,21 @@ pub trait Processor<T> {
     fn process(&self, T) -> ();
 }
 
-impl<I, O> Processor<I> for Pipe<I, O> {
+impl<I, O, T> Processor<I> for Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
     fn process(&self, data: I) -> () {
         let output = (self.inner_transform)(data);
-        self.out_connecter.lock().unwrap().process(output)
+        
+        let connectors = self.out_connectors.lock().unwrap();
+        
+        if (connectors.len() == 1) {
+            // only one connector: so it can be given the transformed value without cloning
+            connectors.first().unwrap().process(output)
+        } else {
+            for connector in connectors.iter() {
+                // give each connector a clone of the output
+                connector.process(output.clone());
+            }    
+        }
     }
 }
 
@@ -358,15 +373,31 @@ mod tests {
         let mut double_pipe = Arc::new(Mutex::new(Pipe::new(double)));
         let mut triple_pipe = Arc::new(Mutex::new(Pipe::new(triple)));
         let mut second_double_pipe = Arc::new(Mutex::new(Pipe::new(double)));
+        let other_pipe = Arc::new(Mutex::new(Pipe::new(|x:i64| { 
+                let result = x*10;
+                println!("Result is {}", result);
+                result
+               })));
+               
+        let branch_pipe = Arc::new(Mutex::new(Pipe::new(|x:i64| { 
+                let result = x*5;
+                println!("Result  on branch is {}", result);
+                result
+               })));
         
         let val:i64 = 50;
         
         let connector1 = Connector::<i64>::sync_connector(triple_pipe.clone());
-        let connector2 = Connector::<i64>::sync_connector(second_double_pipe.clone());
+        let connector2 = Connector::<i64>::async_connector(second_double_pipe.clone());
+        let connector3 = Connector::<i64>::sync_connector(other_pipe.clone());
+        let branch_connector = Connector::<i64>::async_connector(branch_pipe.clone());
+        
         // connect the pipes
         double_pipe.lock().unwrap().connect(connector1);
         triple_pipe.lock().unwrap().connect(connector2);
-           
+        second_double_pipe.lock().unwrap().connect(connector3);
+        triple_pipe.lock().unwrap().connect(branch_connector);
+        
         double_pipe.lock().unwrap().process(val);
     }
     
