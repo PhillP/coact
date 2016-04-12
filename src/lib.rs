@@ -54,6 +54,9 @@ impl<I: 'static + Send> Connector<I> {
         
                     if result.is_ok() {
                         pipearc_clone.lock().unwrap().process(result.ok().unwrap());
+                    } else {
+                        // disconnect the pipe... no longer receiving
+                        break; // no longer receiving on the channel
                     }
                 }                        
             }) 
@@ -347,13 +350,56 @@ impl<T1,T2> SenderReceiverPair<T1, T2> {
 
 /// Indicates the `SenderReceiverPair<T1, T2>` is safe for Sync (multi-threaded) operations
 unsafe impl<T1, T2> Sync for SenderReceiverPair<T1, T2>  {}
+
+macro_rules! connector {
+    
+    ( async $nexty:ty => $next:ident ) => {
+        {
+            Connector::<$nexty>::async_connector($next.clone())
+        }
+    };
+    
+    ( sync $nexty:ty => $next:ident ) => {
+        {
+            Connector::<$nexty>::sync_connector($next.clone())
+        }
+    };
+}
+
+macro_rules! connect {
+    ( $last:ident, $($mode:tt $nexty:ty => $next:expr ),* ) => {
+        {
+            $(
+                let mut next = Arc::new(Mutex::new(Pipe::new($next)));
+            
+                let connector = connector!($mode $nexty => next);
+                
+                $last.lock().unwrap().connect(connector);
+                let mut $last = next.clone();
+            )*
+        }
+    };
+}
+
+macro_rules! pipeline {
+    
+    ( $head:expr, $($mode:tt $nexty:ty => $next:expr),* ) => {
+        {
+            let mut pipe = Arc::new(Mutex::new(Pipe::new($head)));
+            let mut last = pipe.clone();
+            
+            connect!(last, $($mode $nexty => $next),*);
+            
+            pipe
+        }
+    };
+}
    
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use std::thread;
-
     
     fn double(i:i64) -> i64 {
         println!("double");
@@ -366,6 +412,30 @@ mod tests {
         i*3
     }
     
+    #[derive(Clone)]
+    struct TestResult {
+        depth: i32,
+        result: i64
+    }
+    
+    #[test]
+    fn pipe_macro() {
+        let pipe = pipeline!(
+                            |x:i64|{x*2},
+                            sync i64 => |x:i64|{x*10},
+                            sync i64 => |x:i64|{x+2},
+                            async i64 => |x:i64| { 
+                                let result = x*10;
+                                println!("Result is {}", result);
+                                TestResult {
+                                    depth: 0,
+                                    result: result
+                                }
+                            });
+                          
+       pipe.lock().unwrap().process(5);             
+    }
+    
     #[test]
     fn pipe() {
         println!("starting");
@@ -373,10 +443,14 @@ mod tests {
         let mut double_pipe = Arc::new(Mutex::new(Pipe::new(double)));
         let mut triple_pipe = Arc::new(Mutex::new(Pipe::new(triple)));
         let mut second_double_pipe = Arc::new(Mutex::new(Pipe::new(double)));
+        
         let other_pipe = Arc::new(Mutex::new(Pipe::new(|x:i64| { 
                 let result = x*10;
                 println!("Result is {}", result);
-                result
+                TestResult {
+                    depth: 0,
+                    result: result
+                }
                })));
                
         let branch_pipe = Arc::new(Mutex::new(Pipe::new(|x:i64| { 
