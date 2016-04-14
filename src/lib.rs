@@ -1,26 +1,27 @@
 use std::sync::mpsc::{channel};
 use std::sync::mpsc::{Sender, Receiver, RecvError, SendError, TryRecvError};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::thread::{JoinHandle};
 use std::marker::PhantomData;
 
 pub struct Pipe<I,O: 'static, T> where T: Fn(I) -> O, O: Clone  {
-    out_connectors: Arc<Mutex<Vec<Connector<O>>>>,
+    out_connectors: Arc<RwLock<Vec<Connector<O>>>>,
     inner_transform: T,
     _marker: PhantomData<I>  
 }
 
+
 unsafe impl<I,O,T> Send for Pipe<I,O,T> where T: Fn(I) -> O, O: Clone {}
+unsafe impl<I,O,T> Sync for Pipe<I,O,T> where T: Fn(I) -> O, O: Clone {}
 unsafe impl<O> Send for Connector<O> {}
 
 pub enum Connector<T> {
     SynchronousConnector {
-        pipe: Arc<Mutex<Processor<T>>>
+        pipe: Arc<RwLock<Processor<T>>>
     },
     AsynchronousConnector {
-        pipe: Arc<Mutex<Processor<T> + Send>>,
+        pipe: Arc<RwLock<Processor<T> + Send>>,
         sender : Arc<Mutex<Sender<T>>>,
         receiver : Arc<Mutex<Receiver<T>>>,
         thread_handles: Arc<Mutex<Vec<JoinHandle<()>>>>
@@ -28,13 +29,13 @@ pub enum Connector<T> {
 }
 
 impl<I: 'static + Send> Connector<I> {
-    pub fn sync_connector(pipe: Arc<Mutex<Processor<I>>>) -> Connector<I> {
+    pub fn sync_connector(pipe: Arc<RwLock<Processor<I>>>) -> Connector<I> {
         Connector::<I>::SynchronousConnector {
             pipe: pipe
         }
     }
     
-    pub fn async_connector(pipe: Arc<Mutex<Processor<I> + Send>>, threads: u8) -> Connector<I> {
+    pub fn async_connector(pipe: Arc<RwLock<Processor<I> + Send + Sync>>, threads: u8) -> Connector<I> {
         let (tx, rx) = channel::<I>();
         
         let txarc = Arc::new(Mutex::new(tx));
@@ -45,23 +46,23 @@ impl<I: 'static + Send> Connector<I> {
         let pipearc_clone = pipe.clone();
         let rxarc_clone = rxarc.clone();
             
-        let mut connector = Connector::AsynchronousConnector {
+        let connector = Connector::AsynchronousConnector {
             pipe: pipe,
             sender: txarc,
             receiver: rxarc,
             thread_handles: handles.clone()
         };
         
-        for i in 0..threads {
+        for _ in 0..threads {
             let pipearc_clone_for_thread = pipearc_clone.clone();
             let rxarc_clone_for_thread = rxarc_clone.clone();
             
             let handle = thread::spawn(move || {
-                while(true) {
+                loop {
                     let result = rxarc_clone_for_thread.lock().unwrap().recv();
         
                     if result.is_ok() {
-                        pipearc_clone_for_thread.lock().unwrap().process(result.ok().unwrap());
+                        pipearc_clone_for_thread.read().unwrap().process(result.ok().unwrap());
                     } else {
                         // disconnect the pipe... no longer receiving
                         break; // no longer receiving on the channel
@@ -79,21 +80,21 @@ impl<I: 'static + Send> Connector<I> {
 impl<I: 'static + Send, O: 'static, T> Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
     pub fn new(transform: T) -> Pipe<I, O, T> {
         Pipe {
-            out_connectors: Arc::new(Mutex::new(Vec::new())),
+            out_connectors: Arc::new(RwLock::new(Vec::new())),
             inner_transform: transform,
             _marker: PhantomData
         }
     }
     
     pub fn new_with_connector(transform: T, connector: Connector<O>) -> Pipe<I, O, T> {
-        let newPipe = Pipe::<I, O, T>::new(transform);
+        let new_pipe = Pipe::<I, O, T>::new(transform);
         
-        newPipe.out_connectors.lock().unwrap().push(connector);
-        newPipe
+        new_pipe.out_connectors.write().unwrap().push(connector);
+        new_pipe
     }
 
     pub fn connect(&mut self, connector: Connector<O>) {
-        self.out_connectors.lock().unwrap().push(connector);
+        self.out_connectors.write().unwrap().push(connector);
     }
 }
 
@@ -105,9 +106,9 @@ impl<I, O, T> Processor<I> for Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
     fn process(&self, data: I) -> () {
         let output = (self.inner_transform)(data);
         
-        let connectors = self.out_connectors.lock().unwrap();
+        let connectors = self.out_connectors.read().unwrap();
         
-        if (connectors.len() == 1) {
+        if connectors.len() == 1 {
             // only one connector: so it can be given the transformed value without cloning
             connectors.first().unwrap().process(output)
         } else {
@@ -122,12 +123,12 @@ impl<I, O, T> Processor<I> for Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
 impl<T> Processor<T> for Connector<T> {
     fn process(&self, data: T) -> () {
         match *self {
-            Connector::SynchronousConnector { pipe: ref pipe } => pipe.lock().unwrap().process(data),
+            Connector::SynchronousConnector { ref pipe } => pipe.read().unwrap().process(data),
             Connector::AsynchronousConnector {
-                pipe: ref pipe,
-                sender : ref sender,
-                receiver : ref receiver,
-                thread_handles: ref thread_handles
+                ref pipe,
+                ref sender,
+                ref receiver,
+                ref thread_handles
             }   =>  { sender.lock().unwrap().send(data); },
         }
     }
@@ -382,12 +383,12 @@ macro_rules! connect {
     ( $threads:expr, $last:ident, $($mode:tt $nexty:ty => $next:expr ),* ) => {
         {
             $(
-                let mut next = Arc::new(Mutex::new(Pipe::new($next)));
+                let next = Arc::new(RwLock::new(Pipe::new($next)));
             
                 let connector = connector!($threads, $mode $nexty => next);
                 
-                $last.lock().unwrap().connect(connector);
-                let mut $last = next.clone();
+                $last.write().unwrap().connect(connector);
+                let $last = next.clone();
             )*
         }
     };
@@ -396,8 +397,8 @@ macro_rules! connect {
 macro_rules! pipeline {
     ( async_connector_threads: $threads:expr, $head:expr, $($mode:tt $nexty:ty => $next:expr),* ) => {
         {
-            let mut pipe = Arc::new(Mutex::new(Pipe::new($head)));
-            let mut last = pipe.clone();
+            let pipe = Arc::new(RwLock::new(Pipe::new($head)));
+            let last = pipe.clone();
             
             connect!($threads, last, $($mode $nexty => $next),*);
             
@@ -415,7 +416,7 @@ macro_rules! pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, RwLock};
     use std::thread;
     
     fn double(i:i64) -> i64 {
@@ -450,18 +451,18 @@ mod tests {
                                 }
                             });
                           
-       pipe.lock().unwrap().process(5);             
+       pipe.read().unwrap().process(5);             
     }
     
     #[test]
     fn pipe() {
         println!("starting");
         // create a Pipe
-        let mut double_pipe = Arc::new(Mutex::new(Pipe::new(double)));
-        let mut triple_pipe = Arc::new(Mutex::new(Pipe::new(triple)));
-        let mut second_double_pipe = Arc::new(Mutex::new(Pipe::new(double)));
+        let double_pipe = Arc::new(RwLock::new(Pipe::new(double)));
+        let triple_pipe = Arc::new(RwLock::new(Pipe::new(triple)));
+        let second_double_pipe = Arc::new(RwLock::new(Pipe::new(double)));
         
-        let other_pipe = Arc::new(Mutex::new(Pipe::new(|x:i64| { 
+        let other_pipe = Arc::new(RwLock::new(Pipe::new(|x:i64| { 
                 let result = x*10;
                 println!("Result is {}", result);
                 TestResult {
@@ -470,7 +471,7 @@ mod tests {
                 }
                })));
                
-        let branch_pipe = Arc::new(Mutex::new(Pipe::new(|x:i64| { 
+        let branch_pipe = Arc::new(RwLock::new(Pipe::new(|x:i64| { 
                 let result = x*5;
                 println!("Result  on branch is {}", result);
                 result
@@ -484,12 +485,12 @@ mod tests {
         let branch_connector = Connector::<i64>::async_connector(branch_pipe.clone(), 2);
         
         // connect the pipes
-        double_pipe.lock().unwrap().connect(connector1);
-        triple_pipe.lock().unwrap().connect(connector2);
-        second_double_pipe.lock().unwrap().connect(connector3);
-        triple_pipe.lock().unwrap().connect(branch_connector);
+        double_pipe.write().unwrap().connect(connector1);
+        triple_pipe.write().unwrap().connect(connector2);
+        second_double_pipe.write().unwrap().connect(connector3);
+        triple_pipe.write().unwrap().connect(branch_connector);
         
-        double_pipe.lock().unwrap().process(val);
+        double_pipe.write().unwrap().process(val);
     }
     
     #[test]
