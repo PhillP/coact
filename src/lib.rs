@@ -23,9 +23,8 @@ pub enum Connector<T> {
         pipe: Arc<Mutex<Processor<T> + Send>>,
         sender : Arc<Mutex<Sender<T>>>,
         receiver : Arc<Mutex<Receiver<T>>>,
-        thread_handle: JoinHandle<()>
-    },
-    DoNothingConnector
+        thread_handles: Arc<Mutex<Vec<JoinHandle<()>>>>
+    }
 }
 
 impl<I: 'static + Send> Connector<I> {
@@ -35,32 +34,45 @@ impl<I: 'static + Send> Connector<I> {
         }
     }
     
-    pub fn async_connector(pipe: Arc<Mutex<Processor<I> + Send>>) -> Connector<I> {
+    pub fn async_connector(pipe: Arc<Mutex<Processor<I> + Send>>, threads: u8) -> Connector<I> {
         let (tx, rx) = channel::<I>();
         
         let txarc = Arc::new(Mutex::new(tx));
         let rxarc = Arc::new(Mutex::new(rx));
         
+        let handles = Arc::new(Mutex::new(Vec::new()));
+        
         let pipearc_clone = pipe.clone();
         let rxarc_clone = rxarc.clone();
-        
-        Connector::AsynchronousConnector {
+            
+        let mut connector = Connector::AsynchronousConnector {
             pipe: pipe,
             sender: txarc,
             receiver: rxarc,
-            thread_handle: thread::spawn(move || {
+            thread_handles: handles.clone()
+        };
+        
+        for i in 0..threads {
+            let pipearc_clone_for_thread = pipearc_clone.clone();
+            let rxarc_clone_for_thread = rxarc_clone.clone();
+            
+            let handle = thread::spawn(move || {
                 while(true) {
-                    let result = rxarc_clone.lock().unwrap().recv();
+                    let result = rxarc_clone_for_thread.lock().unwrap().recv();
         
                     if result.is_ok() {
-                        pipearc_clone.lock().unwrap().process(result.ok().unwrap());
+                        pipearc_clone_for_thread.lock().unwrap().process(result.ok().unwrap());
                     } else {
                         // disconnect the pipe... no longer receiving
                         break; // no longer receiving on the channel
                     }
                 }                        
-            }) 
+            });
+            
+            handles.lock().unwrap().push(handle);
         }
+        
+        connector
     }
 }
 
@@ -110,13 +122,12 @@ impl<I, O, T> Processor<I> for Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
 impl<T> Processor<T> for Connector<T> {
     fn process(&self, data: T) -> () {
         match *self {
-            Connector::DoNothingConnector => (),
             Connector::SynchronousConnector { pipe: ref pipe } => pipe.lock().unwrap().process(data),
             Connector::AsynchronousConnector {
                 pipe: ref pipe,
                 sender : ref sender,
                 receiver : ref receiver,
-                thread_handle: ref thread_handle
+                thread_handles: ref thread_handles
             }   =>  { sender.lock().unwrap().send(data); },
         }
     }
@@ -353,26 +364,27 @@ unsafe impl<T1, T2> Sync for SenderReceiverPair<T1, T2>  {}
 
 macro_rules! connector {
     
-    ( async $nexty:ty => $next:ident ) => {
-        {
-            Connector::<$nexty>::async_connector($next.clone())
-        }
-    };
-    
-    ( sync $nexty:ty => $next:ident ) => {
+    ( $threads:expr, sync $nexty:ty => $next:ident ) => {
         {
             Connector::<$nexty>::sync_connector($next.clone())
         }
     };
+    
+    ( $threads:expr, async $nexty:ty => $next:ident ) => {
+        {
+            Connector::<$nexty>::async_connector($next.clone(), $threads)
+        }
+    };
+    
 }
 
 macro_rules! connect {
-    ( $last:ident, $($mode:tt $nexty:ty => $next:expr ),* ) => {
+    ( $threads:expr, $last:ident, $($mode:tt $nexty:ty => $next:expr ),* ) => {
         {
             $(
                 let mut next = Arc::new(Mutex::new(Pipe::new($next)));
             
-                let connector = connector!($mode $nexty => next);
+                let connector = connector!($threads, $mode $nexty => next);
                 
                 $last.lock().unwrap().connect(connector);
                 let mut $last = next.clone();
@@ -382,15 +394,20 @@ macro_rules! connect {
 }
 
 macro_rules! pipeline {
-    
-    ( $head:expr, $($mode:tt $nexty:ty => $next:expr),* ) => {
+    ( async_connector_threads: $threads:expr, $head:expr, $($mode:tt $nexty:ty => $next:expr),* ) => {
         {
             let mut pipe = Arc::new(Mutex::new(Pipe::new($head)));
             let mut last = pipe.clone();
             
-            connect!(last, $($mode $nexty => $next),*);
+            connect!($threads, last, $($mode $nexty => $next),*);
             
             pipe
+        }
+    };
+    
+    ( $head:expr, $($mode:tt $nexty:ty => $next:expr),* ) => {
+        {
+            pipeline!(async_connector_threads: 4, $head, $($mode $nexty => $next),*)
         }
     };
 }
@@ -420,7 +437,7 @@ mod tests {
     
     #[test]
     fn pipe_macro() {
-        let pipe = pipeline!(
+        let pipe = pipeline!(async_connector_threads: 8,
                             |x:i64|{x*2},
                             sync i64 => |x:i64|{x*10},
                             sync i64 => |x:i64|{x+2},
@@ -462,9 +479,9 @@ mod tests {
         let val:i64 = 50;
         
         let connector1 = Connector::<i64>::sync_connector(triple_pipe.clone());
-        let connector2 = Connector::<i64>::async_connector(second_double_pipe.clone());
+        let connector2 = Connector::<i64>::async_connector(second_double_pipe.clone(), 4);
         let connector3 = Connector::<i64>::sync_connector(other_pipe.clone());
-        let branch_connector = Connector::<i64>::async_connector(branch_pipe.clone());
+        let branch_connector = Connector::<i64>::async_connector(branch_pipe.clone(), 2);
         
         // connect the pipes
         double_pipe.lock().unwrap().connect(connector1);
