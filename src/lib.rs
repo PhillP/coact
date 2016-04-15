@@ -11,7 +11,6 @@ pub struct Pipe<I,O: 'static, T> where T: Fn(I) -> O, O: Clone  {
     _marker: PhantomData<I>  
 }
 
-
 unsafe impl<I,O,T> Send for Pipe<I,O,T> where T: Fn(I) -> O, O: Clone {}
 unsafe impl<I,O,T> Sync for Pipe<I,O,T> where T: Fn(I) -> O, O: Clone {}
 unsafe impl<O> Send for Connector<O> {}
@@ -25,6 +24,10 @@ pub enum Connector<T> {
         sender : Arc<Mutex<Sender<T>>>,
         receiver : Arc<Mutex<Receiver<T>>>,
         thread_handles: Arc<Mutex<Vec<JoinHandle<()>>>>
+    },
+    QueueConnector {
+        sender : Arc<Mutex<Sender<T>>>,
+        receiver : Arc<Mutex<Receiver<T>>>
     }
 }
 
@@ -74,6 +77,90 @@ impl<I: 'static + Send> Connector<I> {
         }
         
         connector
+    }
+    
+    pub fn queue_connector() -> Connector<I> {
+        let (tx, rx) = channel::<I>();
+        
+        let txarc = Arc::new(Mutex::new(tx));
+        let rxarc = Arc::new(Mutex::new(rx));
+        
+        Connector::QueueConnector {
+            sender: txarc,
+            receiver: rxarc
+        }
+    }
+    
+    /// Receive a message
+    ///
+    /// If there is no message on the channel this call will block until there is one 
+    ///
+    /// Returns a Result<I, RecvError>
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// let sr = channel_pair.second_sender_receiver();
+    /// // . . .
+    /// let result = sr.receive();
+    /// if result.is_ok() {
+    ///     let val = result.ok().unwrap();
+    ///     // do something
+    /// }
+    /// ```
+    pub fn receive(&self) -> Result<I, RecvError> {
+        match *self {
+            Connector::SynchronousConnector { pipe: _ } => { panic!("SynchronousConnector is incapable of receive()"); },
+            Connector::AsynchronousConnector {
+                pipe: _,
+                sender: _,
+                receiver: _,
+                thread_handles: _
+            } =>  { panic!("AsynchronousConnector is incapable of receive()"); },
+            Connector::QueueConnector {
+                sender: _,
+                ref receiver,
+            } =>  { 
+                let result = receiver.lock().unwrap().recv();
+                result 
+            }
+        }
+    }
+    
+    /// Try to receive a message if one is available
+    ///
+    /// If there is no message on the channel this call will return a result containing a `TryRecvError` 
+    ///
+    /// Returns a Result<I, TryRecvError>
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// let sr = channel_pair.second_sender_receiver();
+    /// // . . .
+    /// let result = sr.try_receive();
+    /// if result.is_ok() {
+    ///     let val = result.ok().unwrap();
+    ///     // do something
+    /// }
+    /// ```
+    pub fn try_receive(&self) -> Result<I, TryRecvError> {
+        match *self {
+            Connector::SynchronousConnector { pipe: _ } => { panic!("SynchronousConnector is incapable of try_receive()"); },
+            Connector::AsynchronousConnector {
+                pipe: _,
+                sender: _,
+                receiver: _,
+                thread_handles: _
+            } =>  { panic!("AsynchronousConnector is incapable of try_receive()"); },
+            Connector::QueueConnector {
+                sender: _,
+                ref receiver,
+            } =>  { 
+                let result = receiver.lock().unwrap().try_recv();
+                result 
+            }
+        }
     }
 }
 
@@ -125,11 +212,15 @@ impl<T> Processor<T> for Connector<T> {
         match *self {
             Connector::SynchronousConnector { ref pipe } => pipe.read().unwrap().process(data),
             Connector::AsynchronousConnector {
-                ref pipe,
+                pipe: _,
                 ref sender,
-                ref receiver,
-                ref thread_handles
-            }   =>  { sender.lock().unwrap().send(data); },
+                receiver: _,
+                thread_handles: _
+            } =>  { sender.lock().unwrap().send(data); },
+            Connector::QueueConnector {
+                ref sender,
+                receiver: _,
+            } =>  { sender.lock().unwrap().send(data); }
         }
     }
 }
@@ -406,9 +497,23 @@ macro_rules! pipeline {
         }
     };
     
+    ( async_connector_threads: $threads:expr, $head:expr, $($mode:tt $nexty:ty => $next:expr),* queue) => {
+        {
+            let pipe = pipeline!(async_connector_threads: 4, $head, $($mode $nexty => $next),*);
+            
+            pipe
+        }
+    };
+    
     ( $head:expr, $($mode:tt $nexty:ty => $next:expr),* ) => {
         {
             pipeline!(async_connector_threads: 4, $head, $($mode $nexty => $next),*)
+        }
+    };
+    
+    ( $head:expr, $($mode:tt $nexty:ty => $next:expr),* queue) => {
+        {
+            pipeline!(async_connector_threads: 4, $head, $($mode $nexty => $next),* queue)
         }
     };
 }
@@ -483,14 +588,26 @@ mod tests {
         let connector2 = Connector::<i64>::async_connector(second_double_pipe.clone(), 4);
         let connector3 = Connector::<i64>::sync_connector(other_pipe.clone());
         let branch_connector = Connector::<i64>::async_connector(branch_pipe.clone(), 2);
+        let queue_connector = Connector::<TestResult>::queue_connector();
         
         // connect the pipes
         double_pipe.write().unwrap().connect(connector1);
         triple_pipe.write().unwrap().connect(connector2);
         second_double_pipe.write().unwrap().connect(connector3);
         triple_pipe.write().unwrap().connect(branch_connector);
+        other_pipe.write().unwrap().connect(queue_connector);
         
         double_pipe.write().unwrap().process(val);
+        double_pipe.write().unwrap().process(50);
+        double_pipe.write().unwrap().process(36);
+        
+        for i in 0..3 {
+            let last_pipe = other_pipe.read().unwrap();
+            let last_connectors = last_pipe.out_connectors.read().unwrap();
+            let last_connector = last_connectors.first().unwrap();
+            let result = last_connector.receive();
+            println!("In final loop {}.. result is {}", i, result.ok().unwrap().result);
+        }
     }
     
     #[test]
