@@ -1,15 +1,31 @@
+extern crate core;
+extern crate time;
+
 use std::sync::mpsc::{channel};
 use std::sync::mpsc::{Sender, Receiver, RecvError, SendError, TryRecvError};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Condvar};
 use std::thread;
-use std::thread::{JoinHandle};
+use std::thread::{JoinHandle, sleep};
 use std::marker::PhantomData;
+use core::ops::Deref;
+use time::{Duration, PreciseTime};
+use std::time::Duration as StdDuration;
 
 pub struct Pipe<I,O: 'static, T> where T: Fn(I) -> O, O: Clone  {
     out_connectors: Arc<RwLock<Vec<Connector<O>>>>,
     inner_transform: T,
+    in_count: Arc<RwLock<i64>>,
+    out_count: Arc<RwLock<i64>>,
     _marker: PhantomData<I>  
 }
+
+// Filter
+
+// FlatMapper
+
+// Reducer
+
+// Collector
 
 unsafe impl<I,O,T> Send for Pipe<I,O,T> where T: Fn(I) -> O, O: Clone {}
 unsafe impl<I,O,T> Sync for Pipe<I,O,T> where T: Fn(I) -> O, O: Clone {}
@@ -17,24 +33,32 @@ unsafe impl<O> Send for Connector<O> {}
 
 pub enum Connector<T> {
     SynchronousConnector {
-        pipe: Arc<RwLock<Processor<T>>>
+        pipe: Arc<RwLock<Processor<T>>>,
+        in_count: Arc<RwLock<i64>>,
+        out_count: Arc<RwLock<i64>>
     },
     AsynchronousConnector {
         pipe: Arc<RwLock<Processor<T> + Send>>,
         sender : Arc<Mutex<Sender<T>>>,
         receiver : Arc<Mutex<Receiver<T>>>,
-        thread_handles: Arc<Mutex<Vec<JoinHandle<()>>>>
+        thread_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
+        in_count: Arc<RwLock<i64>>,
+        out_count: Arc<RwLock<i64>>
     },
     QueueConnector {
         sender : Arc<Mutex<Sender<T>>>,
-        receiver : Arc<Mutex<Receiver<T>>>
+        receiver : Arc<Mutex<Receiver<T>>>,
+        in_count: Arc<RwLock<i64>>,
+        out_count: Arc<RwLock<i64>>
     }
 }
 
 impl<I: 'static + Send> Connector<I> {
     pub fn sync_connector(pipe: Arc<RwLock<Processor<I>>>) -> Connector<I> {
         Connector::<I>::SynchronousConnector {
-            pipe: pipe
+            pipe: pipe,
+            in_count: Arc::new(RwLock::new(0)),
+            out_count: Arc::new(RwLock::new(0))
         }
     }
     
@@ -53,7 +77,9 @@ impl<I: 'static + Send> Connector<I> {
             pipe: pipe,
             sender: txarc,
             receiver: rxarc,
-            thread_handles: handles.clone()
+            thread_handles: handles.clone(),
+            in_count: Arc::new(RwLock::new(0)),
+            out_count: Arc::new(RwLock::new(0))
         };
         
         for _ in 0..threads {
@@ -63,7 +89,7 @@ impl<I: 'static + Send> Connector<I> {
             let handle = thread::spawn(move || {
                 loop {
                     let result = rxarc_clone_for_thread.lock().unwrap().recv();
-        
+                    
                     if result.is_ok() {
                         pipearc_clone_for_thread.read().unwrap().process(result.ok().unwrap());
                     } else {
@@ -87,7 +113,9 @@ impl<I: 'static + Send> Connector<I> {
         
         Connector::QueueConnector {
             sender: txarc,
-            receiver: rxarc
+            receiver: rxarc,
+            in_count: Arc::new(RwLock::new(0)),
+            out_count: Arc::new(RwLock::new(0))
         }
     }
     
@@ -110,18 +138,32 @@ impl<I: 'static + Send> Connector<I> {
     /// ```
     pub fn receive(&self) -> Result<I, RecvError> {
         match *self {
-            Connector::SynchronousConnector { pipe: _ } => { panic!("SynchronousConnector is incapable of receive()"); },
+            Connector::SynchronousConnector { 
+                pipe: _, 
+                in_count: _,
+                out_count: _ 
+            } => { panic!("SynchronousConnector is incapable of receive()"); },
             Connector::AsynchronousConnector {
                 pipe: _,
                 sender: _,
                 receiver: _,
-                thread_handles: _
+                thread_handles: _,
+                in_count: _,
+                out_count: _
             } =>  { panic!("AsynchronousConnector is incapable of receive()"); },
             Connector::QueueConnector {
                 sender: _,
                 ref receiver,
+                in_count: _,
+                ref out_count
             } =>  { 
                 let result = receiver.lock().unwrap().recv();
+                
+                if result.is_ok() {
+                    let mut out_count = out_count.write().unwrap();
+                    *out_count += 1;
+                }
+                
                 result 
             }
         }
@@ -146,18 +188,32 @@ impl<I: 'static + Send> Connector<I> {
     /// ```
     pub fn try_receive(&self) -> Result<I, TryRecvError> {
         match *self {
-            Connector::SynchronousConnector { pipe: _ } => { panic!("SynchronousConnector is incapable of try_receive()"); },
+            Connector::SynchronousConnector { 
+                pipe: _, 
+                in_count: _,
+                out_count: _ 
+            } => { panic!("SynchronousConnector is incapable of try_receive()"); },
             Connector::AsynchronousConnector {
                 pipe: _,
                 sender: _,
                 receiver: _,
-                thread_handles: _
+                thread_handles: _,
+                in_count: _,
+                out_count: _
             } =>  { panic!("AsynchronousConnector is incapable of try_receive()"); },
             Connector::QueueConnector {
                 sender: _,
                 ref receiver,
+                in_count: _,
+                ref out_count
             } =>  { 
                 let result = receiver.lock().unwrap().try_recv();
+ 
+                if result.is_ok() {
+                    let mut out_count = out_count.write().unwrap();
+                    *out_count += 1;
+                }
+ 
                 result 
             }
         }
@@ -169,6 +225,8 @@ impl<I: 'static + Send, O: 'static, T> Pipe<I, O, T> where T: Fn(I) -> O, O: Clo
         Pipe {
             out_connectors: Arc::new(RwLock::new(Vec::new())),
             inner_transform: transform,
+            in_count: Arc::new(RwLock::new(0)),
+            out_count: Arc::new(RwLock::new(0)),
             _marker: PhantomData
         }
     }
@@ -179,7 +237,7 @@ impl<I: 'static + Send, O: 'static, T> Pipe<I, O, T> where T: Fn(I) -> O, O: Clo
         new_pipe.out_connectors.write().unwrap().push(connector);
         new_pipe
     }
-
+    
     pub fn connect(&mut self, connector: Connector<O>) {
         self.out_connectors.write().unwrap().push(connector);
     }
@@ -187,10 +245,34 @@ impl<I: 'static + Send, O: 'static, T> Pipe<I, O, T> where T: Fn(I) -> O, O: Clo
 
 pub trait Processor<T> {
     fn process(&self, T) -> ();
+    
+    fn get_processed_count(&self) -> i64;
+    
+    fn has_work_remaining(&self) -> bool;
+    
+    fn wait_work_complete(&self, timeout: Duration) -> bool {
+        let mut has_timed_out = false;
+        let start = PreciseTime::now();
+        
+        while !has_timed_out && self.has_work_remaining() {
+            let duration_since_start = start.to(PreciseTime::now());
+            
+            if duration_since_start > timeout {
+                has_timed_out = true;
+            } else {
+                sleep(StdDuration::from_millis(500));
+            }
+        } 
+    
+        !has_timed_out
+    }
 }
 
 impl<I, O, T> Processor<I> for Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
     fn process(&self, data: I) -> () {
+        let mut in_count = self.in_count.write().unwrap();
+        *in_count += 1;
+        
         let output = (self.inner_transform)(data);
         
         let connectors = self.out_connectors.read().unwrap();
@@ -204,23 +286,186 @@ impl<I, O, T> Processor<I> for Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
                 connector.process(output.clone());
             }    
         }
+        
+        let mut out_count = self.out_count.write().unwrap();
+        *out_count += 1;
     }
+    
+    fn has_work_remaining(&self) -> bool {
+        let mut has_work = false;
+        
+        let in_count = *(self.in_count.read().unwrap().deref());
+        let out_count = *(self.out_count.read().unwrap().deref());
+        
+        if in_count > out_count {
+            has_work = true;
+        } else {
+          let connectors = self.out_connectors.read().unwrap();
+        
+          for connector in connectors.iter() {
+            if connector.has_work_remaining() {
+                has_work = true;
+                break;        
+            } 
+            
+            if out_count > connector.get_processed_count() {
+                has_work = true;
+                break;
+            }
+          }    
+        }
+        
+        has_work
+    }
+    
+    fn get_processed_count(&self) -> i64 {
+        *(self.out_count.read().unwrap().deref())
+    }    
 }
 
 impl<T> Processor<T> for Connector<T> {
     fn process(&self, data: T) -> () {
         match *self {
-            Connector::SynchronousConnector { ref pipe } => pipe.read().unwrap().process(data),
+            Connector::SynchronousConnector { 
+                ref pipe,
+                ref in_count, 
+                ref out_count 
+                } => {
+                    let mut in_count = in_count.write().unwrap();
+                    *in_count += 1;
+         
+                    pipe.read().unwrap().process(data);
+                    
+                    let mut out_count = out_count.write().unwrap();
+                    *out_count += 1;
+                },
             Connector::AsynchronousConnector {
                 pipe: _,
                 ref sender,
                 receiver: _,
-                thread_handles: _
-            } =>  { sender.lock().unwrap().send(data); },
+                thread_handles: _,
+                ref in_count, 
+                ref out_count 
+            } =>  { 
+                let mut in_count = in_count.write().unwrap();
+                *in_count += 1;
+                
+                sender.lock().unwrap().send(data);
+                
+                let mut out_count = out_count.write().unwrap();
+                *out_count += 1;
+            },
             Connector::QueueConnector {
                 ref sender,
                 receiver: _,
-            } =>  { sender.lock().unwrap().send(data); }
+                ref in_count, 
+                ref out_count 
+            } =>  { 
+                let mut in_count = in_count.write().unwrap();
+                *in_count += 1;
+                
+                sender.lock().unwrap().send(data);
+            }
+        }
+    }
+    
+    fn has_work_remaining(&self) -> bool {
+        match *self {
+            Connector::SynchronousConnector { 
+                ref pipe,
+                ref in_count, 
+                ref out_count 
+                } => {
+                    let mut has_work = false;
+                    let in_count_unwrap = *(in_count.read().unwrap().deref());
+                    let out_count_unwrap = *(out_count.read().unwrap().deref());
+            
+                    if in_count_unwrap > out_count_unwrap {
+                       has_work = true;
+                    } else {
+                       if pipe.read().unwrap().has_work_remaining() {
+                           has_work = true;
+                       } else {
+                            let pipe_processed_count = pipe.read().unwrap().get_processed_count();
+                            if out_count_unwrap > pipe_processed_count {
+                                has_work = true;
+                            }
+                       }
+                    }
+                    
+                    has_work
+                },
+            Connector::AsynchronousConnector {
+                ref pipe,
+                sender: _,
+                receiver: _,
+                thread_handles: _,
+                ref in_count, 
+                ref out_count 
+            } =>  { 
+                let mut has_work = false;
+                let in_count_unwrap = *(in_count.read().unwrap().deref());
+                let out_count_unwrap = *(out_count.read().unwrap().deref());
+            
+                if in_count_unwrap > out_count_unwrap {
+                    has_work = true;
+                } else {
+                    if pipe.read().unwrap().has_work_remaining() {
+                        has_work = true;
+                    } else {
+                        let pipe_processed_count = pipe.read().unwrap().get_processed_count();
+                        if out_count_unwrap > pipe_processed_count {
+                            has_work = true;
+                        }
+                    }
+                }
+                
+                has_work
+            },
+            Connector::QueueConnector {
+                sender: _,
+                receiver: _,
+                ref in_count, 
+                ref out_count 
+            } =>  { 
+                let in_count_unwrap = *(in_count.read().unwrap().deref());
+                let out_count_unwrap = *(out_count.read().unwrap().deref());
+                
+                return in_count_unwrap > out_count_unwrap;
+            }
+        }
+    }
+    
+    fn get_processed_count(&self) -> i64 {
+        match *self {
+            Connector::SynchronousConnector { 
+                pipe: _,
+                in_count: _, 
+                ref out_count 
+                } => {
+                    let count:i64 = *(out_count.read().unwrap().deref());
+                count
+                },
+            Connector::AsynchronousConnector {
+                pipe: _,
+                sender: _,
+                receiver: _,
+                thread_handles: _,
+                in_count: _, 
+                ref out_count 
+            } =>  { 
+                let count:i64 = *(out_count.read().unwrap().deref());
+                count
+            },
+            Connector::QueueConnector {
+                sender: _,
+                receiver: _,
+                in_count: _, 
+                ref out_count 
+            } =>  { 
+                let count:i64 = *(out_count.read().unwrap().deref());
+                count
+            }
         }
     }
 }
@@ -523,6 +768,10 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex, RwLock};
     use std::thread;
+    use std::thread::{sleep};
+    use time::{Duration};
+    use std::time::Duration as StdDuration;
+    
     
     fn double(i:i64) -> i64 {
         println!("double");
@@ -570,6 +819,7 @@ mod tests {
         let other_pipe = Arc::new(RwLock::new(Pipe::new(|x:i64| { 
                 let result = x*10;
                 println!("Result is {}", result);
+                sleep(StdDuration::from_millis(2000));
                 TestResult {
                     depth: 0,
                     result: result
@@ -594,7 +844,7 @@ mod tests {
         double_pipe.write().unwrap().connect(connector1);
         triple_pipe.write().unwrap().connect(connector2);
         second_double_pipe.write().unwrap().connect(connector3);
-        triple_pipe.write().unwrap().connect(branch_connector);
+        //triple_pipe.write().unwrap().connect(branch_connector);
         other_pipe.write().unwrap().connect(queue_connector);
         
         double_pipe.write().unwrap().process(val);
@@ -606,8 +856,15 @@ mod tests {
             let last_connectors = last_pipe.out_connectors.read().unwrap();
             let last_connector = last_connectors.first().unwrap();
             let result = last_connector.receive();
-            println!("In final loop {}.. result is {}", i, result.ok().unwrap().result);
+            if result.is_ok() {
+             println!("In final loop {}.. result is {}", i, result.ok().unwrap().result);
+            }
         }
+        
+        let completed = double_pipe.write().unwrap().wait_work_complete(Duration::milliseconds(10000));
+        
+        println!("Work completed {}", completed);
+        
     }
     
     #[test]
