@@ -11,6 +11,37 @@ use core::ops::Deref;
 use time::{Duration, PreciseTime};
 use std::time::Duration as StdDuration;
 
+pub struct Pipeline<TIn, TLastIn: 'static, TOut: 'static, T> where T: Fn(TLastIn) -> TOut, TOut: Clone  {
+    pipe_in_connector: Arc<RwLock<Connector<TIn>>>,
+    pipe_in: Arc<RwLock<Processor<TIn>>>,
+    pipe_out: Arc<RwLock<Pipe<TLastIn, TOut, T>>>,
+}
+
+impl<TIn: 'static + Send, TLastIn: 'static + Send, TOut: 'static, T> Pipeline<TIn, TLastIn, TOut, T> where TIn: Clone, TLastIn: Clone, TOut: Clone, T: Fn(TLastIn) -> TOut {
+    pub fn new(pipe_in: Arc<RwLock<Processor<TIn> + Send + Sync>>, pipe_out: Arc<RwLock<Pipe<TLastIn, TOut, T>>>) -> Pipeline<TIn, TLastIn, TOut, T> {
+        let connector = Connector::async_connector(pipe_in.clone(), 1);
+        
+        Pipeline {
+            pipe_in_connector: Arc::new(RwLock::new(connector)),
+            pipe_in: pipe_in,
+            pipe_out: pipe_out
+        }
+    }
+    
+    pub fn flush(&self) {
+        self.pipe_in_connector.read().unwrap().process(None);
+    }
+    
+    pub fn flush_and_wait(&self, timeout: Duration) {
+      self.flush();
+      self.pipe_in.read().unwrap().wait_work_complete(timeout);
+    }
+    
+    pub fn process(&self, data: TIn) {
+        self.pipe_in_connector.read().unwrap().process(Some(data));    
+    }
+}
+    
 pub struct Pipe<I,O: 'static, T> where T: Fn(I) -> O, O: Clone  {
     out_connectors: Arc<RwLock<Vec<Connector<O>>>>,
     inner_transform: T,
@@ -19,7 +50,33 @@ pub struct Pipe<I,O: 'static, T> where T: Fn(I) -> O, O: Clone  {
     _marker: PhantomData<I>  
 }
 
+pub struct Filter<I, T> where T: Fn(I) -> bool, I: Clone  {
+    out_connectors: Arc<RwLock<Vec<Connector<I>>>>,
+    filter_function: T,
+    in_count: Arc<RwLock<i64>>,
+    out_count: Arc<RwLock<i64>>,
+}
+
+pub struct Mapper<I,O: 'static, T> where T: Fn(I) -> O, O: Clone  {
+    out_connectors: Arc<RwLock<Vec<Connector<O>>>>,
+    inner_transform: T,
+    in_count: Arc<RwLock<i64>>,
+    out_count: Arc<RwLock<i64>>,
+    _marker: PhantomData<I>  
+}
+
+pub struct FlatMapper<I,O: 'static, T> where T: Fn(I) -> O, O: Clone  {
+    out_connectors: Arc<RwLock<Vec<Connector<O>>>>,
+    inner_transform: T,
+    in_count: Arc<RwLock<i64>>,
+    out_count: Arc<RwLock<i64>>,
+    _marker: PhantomData<I>  
+}
+
+
 // Filter
+
+// Mapper
 
 // FlatMapper
 
@@ -39,8 +96,8 @@ pub enum Connector<T> {
     },
     AsynchronousConnector {
         pipe: Arc<RwLock<Processor<T> + Send>>,
-        sender : Arc<Mutex<Sender<T>>>,
-        receiver : Arc<Mutex<Receiver<T>>>,
+        sender : Arc<Mutex<Sender<Option<T>>>>,
+        receiver : Arc<Mutex<Receiver<Option<T>>>>,
         thread_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
         in_count: Arc<RwLock<i64>>,
         out_count: Arc<RwLock<i64>>
@@ -63,7 +120,7 @@ impl<I: 'static + Send> Connector<I> {
     }
     
     pub fn async_connector(pipe: Arc<RwLock<Processor<I> + Send + Sync>>, threads: u8) -> Connector<I> {
-        let (tx, rx) = channel::<I>();
+        let (tx, rx) = channel::<Option<I>>();
         
         let txarc = Arc::new(Mutex::new(tx));
         let rxarc = Arc::new(Mutex::new(rx));
@@ -244,7 +301,7 @@ impl<I: 'static + Send, O: 'static, T> Pipe<I, O, T> where T: Fn(I) -> O, O: Clo
 }
 
 pub trait Processor<T> {
-    fn process(&self, T) -> ();
+    fn process(&self, Option<T>) -> ();
     
     fn get_processed_count(&self) -> i64;
     
@@ -269,11 +326,20 @@ pub trait Processor<T> {
 }
 
 impl<I, O, T> Processor<I> for Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
-    fn process(&self, data: I) -> () {
+    
+    fn process(&self, data: Option<I>) -> () {
+
+        let output = {
+            // only perform the transformation is Some(data) was provided
+            match data {
+                None => None,
+                Some(inner_data) => Some((self.inner_transform)(inner_data)),
+            }
+        };
+        
+        // count inputs
         let mut in_count = self.in_count.write().unwrap();
         *in_count += 1;
-        
-        let output = (self.inner_transform)(data);
         
         let connectors = self.out_connectors.read().unwrap();
         
@@ -287,6 +353,7 @@ impl<I, O, T> Processor<I> for Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
             }    
         }
         
+        // count outputs
         let mut out_count = self.out_count.write().unwrap();
         *out_count += 1;
     }
@@ -324,7 +391,7 @@ impl<I, O, T> Processor<I> for Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
 }
 
 impl<T> Processor<T> for Connector<T> {
-    fn process(&self, data: T) -> () {
+    fn process(&self, data: Option<T>) -> () {
         match *self {
             Connector::SynchronousConnector { 
                 ref pipe,
@@ -364,7 +431,10 @@ impl<T> Processor<T> for Connector<T> {
                 let mut in_count = in_count.write().unwrap();
                 *in_count += 1;
                 
-                sender.lock().unwrap().send(data);
+                match data {
+                    None => Ok(()),
+                    Some(inner_data) => sender.lock().unwrap().send(inner_data), 
+                };
             }
         }
     }
@@ -731,34 +801,20 @@ macro_rules! connect {
 }
 
 macro_rules! pipeline {
-    ( async_connector_threads: $threads:expr, $head:expr, $($mode:tt $nexty:ty => $next:expr),* ) => {
+    ( async_connector_threads: $threads:expr, $headty:ty => $head:expr, $($mode:tt $nexty:ty => $next:expr),* => $outty:ty) => {
         {
             let pipe = Arc::new(RwLock::new(Pipe::new($head)));
             let last = pipe.clone();
             
             connect!($threads, last, $($mode $nexty => $next),*);
             
-            pipe
+            Pipeline::new(pipe, last.clone())
         }
     };
-    
-    ( async_connector_threads: $threads:expr, $head:expr, $($mode:tt $nexty:ty => $next:expr),* queue) => {
+        
+    ( $headty:ty => $head:expr, $($mode:tt $nexty:ty => $next:expr),* => $outty:ty) => {
         {
-            let pipe = pipeline!(async_connector_threads: 4, $head, $($mode $nexty => $next),*);
-            
-            pipe
-        }
-    };
-    
-    ( $head:expr, $($mode:tt $nexty:ty => $next:expr),* ) => {
-        {
-            pipeline!(async_connector_threads: 4, $head, $($mode $nexty => $next),*)
-        }
-    };
-    
-    ( $head:expr, $($mode:tt $nexty:ty => $next:expr),* queue) => {
-        {
-            pipeline!(async_connector_threads: 4, $head, $($mode $nexty => $next),* queue)
+            pipeline!(async_connector_threads: 4, $headty => $head, $($mode $nexty => $next),* => $outty:ty)
         }
     };
 }
@@ -792,8 +848,8 @@ mod tests {
     
     #[test]
     fn pipe_macro() {
-        let pipe = pipeline!(async_connector_threads: 8,
-                            |x:i64|{x*2},
+        let pipeline = pipeline!(async_connector_threads: 8,
+                            i64 => |x:i64|{x*2},
                             sync i64 => |x:i64|{x*10},
                             sync i64 => |x:i64|{x+2},
                             async i64 => |x:i64| { 
@@ -803,9 +859,15 @@ mod tests {
                                     depth: 0,
                                     result: result
                                 }
-                            });
+                            }
+                            => TestResult
+                            );
                           
-       pipe.read().unwrap().process(5);             
+       pipeline.process(5);
+       println!("Flush and wait....");
+                                
+       pipeline.flush_and_wait(Duration::milliseconds(10000));
+       println!("Done....");
     }
     
     #[test]
@@ -847,9 +909,9 @@ mod tests {
         //triple_pipe.write().unwrap().connect(branch_connector);
         other_pipe.write().unwrap().connect(queue_connector);
         
-        double_pipe.write().unwrap().process(val);
-        double_pipe.write().unwrap().process(50);
-        double_pipe.write().unwrap().process(36);
+        double_pipe.write().unwrap().process(Some(val));
+        double_pipe.write().unwrap().process(Some(50));
+        double_pipe.write().unwrap().process(Some(36));
         
         for i in 0..3 {
             let last_pipe = other_pipe.read().unwrap();
