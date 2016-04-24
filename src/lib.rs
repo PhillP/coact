@@ -32,21 +32,39 @@ impl<TIn: 'static + Send, TLastIn: 'static + Send, TOut: 'static, T> Pipeline<TI
         self.pipe_in_connector.read().unwrap().process(None);
     }
     
-    pub fn flush_and_wait(&self, timeout: Duration) {
+    pub fn flush_and_wait(&self, timeout: StdDuration) -> bool {
+      let current_batch_count = {
+          let pipe_out = self.pipe_out.read().unwrap();
+          let count = *(pipe_out.processing_state.complete_batch_count.lock().unwrap().deref());
+          
+          count   
+      };
+      
       self.flush();
-      self.pipe_in.read().unwrap().wait_work_complete(timeout);
+      
+      let pipeout =  self.pipe_out.read().unwrap();
+      pipeout.processing_state.wait_complete_batch_count(current_batch_count + 1, timeout)
     }
     
     pub fn process(&self, data: TIn) {
         self.pipe_in_connector.read().unwrap().process(Some(data));    
     }
 }
-    
+
+pub struct ProcessingState  {
+    is_batch_ending_check_lock: Mutex<i8>,
+    is_batch_ending: Mutex<bool>,
+    state_change_condvar: Condvar,
+    complete_batch_count: Mutex<i64>,
+    batch_completed_condvar: Condvar,
+    in_count: RwLock<i64>,
+    out_count: RwLock<i64>,
+}
+
 pub struct Pipe<I,O: 'static, T> where T: Fn(I) -> O, O: Clone  {
     out_connectors: Arc<RwLock<Vec<Connector<O>>>>,
     inner_transform: T,
-    in_count: Arc<RwLock<i64>>,
-    out_count: Arc<RwLock<i64>>,
+    processing_state: Arc<ProcessingState>,
     _marker: PhantomData<I>  
 }
 
@@ -277,13 +295,69 @@ impl<I: 'static + Send> Connector<I> {
     }
 }
 
+impl ProcessingState {
+    pub fn new() -> ProcessingState {
+        ProcessingState {
+            is_batch_ending_check_lock: Mutex::new(0),
+            is_batch_ending: Mutex::new(false),
+            state_change_condvar: Condvar::new(),
+            in_count: RwLock::new(0),
+            out_count: RwLock::new(0),
+            complete_batch_count: Mutex::new(0),
+            batch_completed_condvar: Condvar::new()
+        }
+    }
+    
+    pub fn wait_if_batch_ending(&self) {
+        let mut batch_ending = self.is_batch_ending.lock().unwrap();
+        while *batch_ending {
+            batch_ending = self.state_change_condvar.wait(batch_ending).unwrap();
+        }
+    }
+    
+    pub fn set_batch_ending(&self) {
+        let mut batch_ending = self.is_batch_ending.lock().unwrap();
+        *batch_ending = true;
+        self.state_change_condvar.notify_all();
+    }
+    
+    pub fn set_batch_ended(&self) {
+        let mut batch_ending = self.is_batch_ending.lock().unwrap();
+        *batch_ending = false;
+        
+        self.state_change_condvar.notify_all();
+        
+        let mut complete_batch_count = self.complete_batch_count.lock().unwrap();
+        *complete_batch_count += 1;
+        
+        self.batch_completed_condvar.notify_all();
+    }
+    
+    pub fn wait_complete_batch_count(&self, wait_count: i64, timeout: StdDuration) -> bool {
+        let mut complete_batch_count = self.complete_batch_count.lock().unwrap();
+        let mut timed_out = false;
+        println!("Complete batch count {}",*complete_batch_count);
+        while *complete_batch_count < wait_count && !timed_out {
+            let (cbc, wait_timeout) = self.batch_completed_condvar.wait_timeout(complete_batch_count, timeout).unwrap();
+             
+            if wait_timeout.timed_out() {
+                 timed_out = true;
+                 break;    
+            }
+            
+            complete_batch_count = cbc;
+        }
+        
+        timed_out
+    }
+}
+
 impl<I: 'static + Send, O: 'static, T> Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
     pub fn new(transform: T) -> Pipe<I, O, T> {
         Pipe {
             out_connectors: Arc::new(RwLock::new(Vec::new())),
             inner_transform: transform,
-            in_count: Arc::new(RwLock::new(0)),
-            out_count: Arc::new(RwLock::new(0)),
+            processing_state: Arc::new(ProcessingState::new()),
             _marker: PhantomData
         }
     }
@@ -328,18 +402,45 @@ pub trait Processor<T> {
 impl<I, O, T> Processor<I> for Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
     
     fn process(&self, data: Option<I>) -> () {
-
-        let output = {
-            // only perform the transformation is Some(data) was provided
-            match data {
-                None => None,
-                Some(inner_data) => Some((self.inner_transform)(inner_data)),
+        
+        let batch_ending_signifier = {
+            
+            // hold the lock check mutex... onlt one thread allowed here at a time
+            let lock = self.processing_state.is_batch_ending_check_lock.lock();
+                        
+            if data.is_none() {
+                // if a batch is already ending.. wait here until the previous batch has ended
+                self.processing_state.wait_if_batch_ending();
+                
+                // then set batch ending
+                self.processing_state.set_batch_ending();
+                
+                true // this is the end of a batch
+            } else {
+                false
             }
         };
         
-        // count inputs
-        let mut in_count = self.in_count.write().unwrap();
-        *in_count += 1;
+        if !batch_ending_signifier {
+            // normal data must wait if the batch is ending
+            self.processing_state.wait_if_batch_ending();
+        }
+        
+        let output = {
+            // only perform the transformation is Some(data) was provided
+            match data {
+                None => {
+                    None
+                },
+                Some(inner_data) => {
+                    // count normal inputs
+                    let mut in_count = self.processing_state.in_count.write().unwrap();
+                    *in_count += 1;
+
+                    Some((self.inner_transform)(inner_data))
+                },
+            }
+        };
         
         let connectors = self.out_connectors.read().unwrap();
         
@@ -353,16 +454,20 @@ impl<I, O, T> Processor<I> for Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
             }    
         }
         
-        // count outputs
-        let mut out_count = self.out_count.write().unwrap();
-        *out_count += 1;
+        if batch_ending_signifier {
+            self.processing_state.set_batch_ended();
+        } else {
+            // count normal outputs only
+            let mut out_count = self.processing_state.out_count.write().unwrap();
+            *out_count += 1;
+        }
     }
     
     fn has_work_remaining(&self) -> bool {
         let mut has_work = false;
         
-        let in_count = *(self.in_count.read().unwrap().deref());
-        let out_count = *(self.out_count.read().unwrap().deref());
+        let in_count = *(self.processing_state.in_count.read().unwrap().deref());
+        let out_count = *(self.processing_state.out_count.read().unwrap().deref());
         
         if in_count > out_count {
             has_work = true;
@@ -386,7 +491,7 @@ impl<I, O, T> Processor<I> for Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
     }
     
     fn get_processed_count(&self) -> i64 {
-        *(self.out_count.read().unwrap().deref())
+        *(self.processing_state.out_count.read().unwrap().deref())
     }    
 }
 
@@ -565,6 +670,7 @@ pub struct SendOrReceiveError<T>
     send_error: Option<SendError<T>>,
     receive_error: Option<RecvError>
 }
+
 
 /// Implementation of a ChannelPair
 impl<T1,T2> ChannelPair<T1, T2> {
@@ -826,6 +932,7 @@ mod tests {
     use std::thread;
     use std::thread::{sleep};
     use time::{Duration};
+    use core::ops::Deref;
     use std::time::Duration as StdDuration;
     
     
@@ -866,8 +973,12 @@ mod tests {
        pipeline.process(5);
        println!("Flush and wait....");
                                 
-       pipeline.flush_and_wait(Duration::milliseconds(10000));
+       pipeline.flush_and_wait(StdDuration::from_millis(10000));
        println!("Done....");
+       let last_pipe = pipeline.pipe_out.read().unwrap();
+       
+       let complete_batch_count = *(last_pipe.processing_state.complete_batch_count.lock().unwrap().deref());
+       assert_eq!(1, complete_batch_count);
     }
     
     #[test]
@@ -926,7 +1037,6 @@ mod tests {
         let completed = double_pipe.write().unwrap().wait_work_complete(Duration::milliseconds(10000));
         
         println!("Work completed {}", completed);
-        
     }
     
     #[test]
