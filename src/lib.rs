@@ -11,14 +11,14 @@ use core::ops::Deref;
 use time::{Duration, PreciseTime};
 use std::time::Duration as StdDuration;
 
-pub struct Pipeline<TIn, TLastIn: 'static, TOut: 'static, T> where T: Fn(TLastIn) -> TOut, TOut: Clone  {
+pub struct Pipeline<TIn, TLastIn: 'static, TOut: 'static> where TOut: Clone  {
     pipe_in_connector: Arc<RwLock<Connector<TIn>>>,
     pipe_in: Arc<RwLock<Processor<TIn>>>,
-    pipe_out: Arc<RwLock<Pipe<TLastIn, TOut, T>>>,
+    pipe_out: Arc<RwLock<Pipe<TLastIn, TOut>>>,
 }
 
-impl<TIn: 'static + Send, TLastIn: 'static + Send, TOut: 'static, T> Pipeline<TIn, TLastIn, TOut, T> where TIn: Clone, TLastIn: Clone, TOut: Clone, T: Fn(TLastIn) -> TOut {
-    pub fn new(pipe_in: Arc<RwLock<Processor<TIn> + Send + Sync>>, pipe_out: Arc<RwLock<Pipe<TLastIn, TOut, T>>>) -> Pipeline<TIn, TLastIn, TOut, T> {
+impl<TIn: 'static + Send, TLastIn: 'static + Send, TOut: 'static> Pipeline<TIn, TLastIn, TOut> where TIn: Clone, TLastIn: Clone, TOut: Clone {
+    pub fn new(pipe_in: Arc<RwLock<Processor<TIn> + Send + Sync>>, pipe_out: Arc<RwLock<Pipe<TLastIn, TOut>>>) -> Pipeline<TIn, TLastIn, TOut> {
         let connector = Connector::async_connector(pipe_in.clone(), 1);
         
         Pipeline {
@@ -61,11 +61,11 @@ pub struct ProcessingState  {
     out_count: RwLock<i64>,
 }
 
-pub struct Pipe<I,O: 'static, T> where T: Fn(I) -> O, O: Clone  {
+pub struct Pipe<I,O> where O: Clone {
     out_connectors: Arc<RwLock<Vec<Connector<O>>>>,
-    inner_transform: T,
+    pipe_processor: Arc<PipeProcessor<I,O>>,
     processing_state: Arc<ProcessingState>,
-    _marker: PhantomData<I>  
+    _marker: PhantomData<I>
 }
 
 pub struct Filter<I, T> where T: Fn(I) -> bool, I: Clone  {
@@ -102,8 +102,8 @@ pub struct FlatMapper<I,O: 'static, T> where T: Fn(I) -> O, O: Clone  {
 
 // Collector
 
-unsafe impl<I,O,T> Send for Pipe<I,O,T> where T: Fn(I) -> O, O: Clone {}
-unsafe impl<I,O,T> Sync for Pipe<I,O,T> where T: Fn(I) -> O, O: Clone {}
+unsafe impl<I,O> Send for Pipe<I,O> where O: Clone {}
+unsafe impl<I,O> Sync for Pipe<I,O> where O: Clone {}
 unsafe impl<O> Send for Connector<O> {}
 
 pub enum Connector<T> {
@@ -352,18 +352,27 @@ impl ProcessingState {
     }
 }
 
-impl<I: 'static + Send, O: 'static, T> Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
-    pub fn new(transform: T) -> Pipe<I, O, T> {
+impl<I: 'static + Send, O: 'static> Pipe<I, O> where I: Clone, O: Clone {
+    pub fn new<Transform: 'static>(transform: Transform) -> Pipe<I, O> where Transform: Fn(I) -> O {
         Pipe {
             out_connectors: Arc::new(RwLock::new(Vec::new())),
-            inner_transform: transform,
+            pipe_processor: Arc::new(TransformPipeProcessor::<I,O,Transform>::new(transform)),
             processing_state: Arc::new(ProcessingState::new()),
             _marker: PhantomData
         }
     }
     
-    pub fn new_with_connector(transform: T, connector: Connector<O>) -> Pipe<I, O, T> {
-        let new_pipe = Pipe::<I, O, T>::new(transform);
+    pub fn filter<Filter: 'static>(filter_function: Filter) -> Pipe<I, I> where Filter: Fn(I) -> bool {
+        Pipe::<I,I> {
+            out_connectors: Arc::new(RwLock::new(Vec::new())),
+            pipe_processor: Arc::new(FilterPipeProcessor::<I,Filter>::new(filter_function)),
+            processing_state: Arc::new(ProcessingState::new()),
+            _marker: PhantomData
+        }
+    }
+    
+    pub fn new_with_connector<Transform: 'static>(transform: Transform, connector: Connector<O>) -> Pipe<I, O> where Transform: Fn(I) -> O {
+        let new_pipe = Pipe::<I, O>::new(transform);
         
         new_pipe.out_connectors.write().unwrap().push(connector);
         new_pipe
@@ -371,6 +380,147 @@ impl<I: 'static + Send, O: 'static, T> Pipe<I, O, T> where T: Fn(I) -> O, O: Clo
     
     pub fn connect(&mut self, connector: Connector<O>) {
         self.out_connectors.write().unwrap().push(connector);
+    }
+    
+    fn process_in(&self, data: Option<I>) -> Option<I> {  
+         let batch_ending_signifier = {
+            
+            // hold the lock check mutex... onlt one thread allowed here at a time
+            let lock = self.processing_state.is_batch_ending_check_lock.lock();
+                        
+            if data.is_none() {
+                // if a batch is already ending.. wait here until the previous batch has ended
+                self.processing_state.wait_if_batch_ending();
+                
+                // then set batch ending
+                self.processing_state.set_batch_ending();
+                
+                true // this is the end of a batch
+            } else {
+                false
+            }
+        };
+        
+        if !batch_ending_signifier {
+            // normal data must wait if the batch is ending
+            self.processing_state.wait_if_batch_ending();
+        }
+        
+        data
+    } 
+
+    fn process_out(&self, data: Option<O>) -> () {  
+        let connectors = self.out_connectors.read().unwrap();
+        let is_batch_end_signifier = data.is_none();
+        
+        if connectors.len() == 1 {
+            // only one connector: so it can be given the transformed value without cloning
+            connectors.first().unwrap().process(data)
+        } else {
+            for connector in connectors.iter() {
+                // give each connector a clone of the output
+                connector.process(data.clone());
+            }    
+        }
+        
+        if is_batch_end_signifier {
+            self.processing_state.set_batch_ended();
+        } else {
+            // count normal outputs only
+            let mut out_count = self.processing_state.out_count.write().unwrap();
+            *out_count += 1;
+        }
+    }
+}
+
+
+pub trait PipeProcessor<TIn, TOut> {
+    fn process_with_callback(&self, input: Option<TIn>, pipe: &Pipe<TIn,TOut>) -> ();   
+}
+
+pub struct TransformPipeProcessor<TIn, TOut, Transform> 
+    where   
+            Transform: Fn(TIn) -> TOut, 
+            TOut: Clone  {
+    inner_transform: Transform,
+    _marker1: PhantomData<TIn>,
+    _marker2: PhantomData<TOut>
+}
+
+impl<TIn: 'static + Send, TOut: 'static, Transform: 'static> TransformPipeProcessor<TIn, TOut, Transform>
+    where
+            Transform: Fn(TIn) -> TOut, 
+            TOut: Clone {
+
+    pub fn new(transform: Transform) -> TransformPipeProcessor<TIn, TOut, Transform> {
+        TransformPipeProcessor {
+            inner_transform: transform,
+            _marker1: PhantomData,
+            _marker2: PhantomData
+        }
+    }
+}
+
+impl<TIn: 'static + Send, TOut: 'static, Transform> PipeProcessor<TIn, TOut> for TransformPipeProcessor<TIn, TOut, Transform> 
+    where
+        Transform: Fn(TIn) -> TOut,
+        TIn: Clone, 
+        TOut: Clone {
+ 
+    fn process_with_callback(&self, input: Option<TIn>, pipe: &Pipe<TIn,TOut>) -> () {
+        
+        let yield_output = |o:TOut| { pipe.process_out(Some(o)); };
+        
+        match input {
+            None => {
+                pipe.process_out(None);
+            },
+            Some(inner_data) => {
+                let transformed_output = (self.inner_transform)(inner_data);
+                yield_output(transformed_output);            
+            },
+        };
+    }
+}
+
+pub struct FilterPipeProcessor<TIn, Filter> 
+    where   Filter: Fn(TIn) -> bool, TIn: Clone  {
+    inner_filter: Filter,
+    _marker1: PhantomData<TIn>
+}
+
+impl<TIn: 'static + Send, Filter: 'static> FilterPipeProcessor<TIn, Filter>
+    where   Filter: Fn(TIn) -> bool, TIn: Clone {
+
+    pub fn new(filter: Filter) -> FilterPipeProcessor<TIn, Filter> {
+        FilterPipeProcessor {
+            inner_filter: filter,
+            _marker1: PhantomData
+        }
+    }
+}
+ 
+impl<TIn: 'static + Send, Filter> PipeProcessor<TIn, TIn> for FilterPipeProcessor<TIn, Filter> 
+    where   Filter: Fn(TIn) -> bool, TIn: Clone  {
+ 
+    fn process_with_callback(&self, input: Option<TIn>, pipe: &Pipe<TIn,TIn>) -> () {
+        
+        let input_clone = input.clone();
+        
+        let pass_value = 
+            match input {
+                None => {
+                    true
+                },
+                Some(inner_data) => {
+                    // call filter function
+                    (self.inner_filter)(inner_data) 
+                },
+            };
+            
+       if pass_value {
+           pipe.process_out(input_clone);
+       }
     }
 }
 
@@ -399,68 +549,18 @@ pub trait Processor<T> {
     }
 }
 
-impl<I, O, T> Processor<I> for Pipe<I, O, T> where T: Fn(I) -> O, O: Clone {
+impl<I: 'static + Send, O: 'static> Processor<I> for Pipe<I, O> where I: Clone, O: Clone {
     
     fn process(&self, data: Option<I>) -> () {
+        let data = self.process_in(data);
         
-        let batch_ending_signifier = {
-            
-            // hold the lock check mutex... onlt one thread allowed here at a time
-            let lock = self.processing_state.is_batch_ending_check_lock.lock();
-                        
-            if data.is_none() {
-                // if a batch is already ending.. wait here until the previous batch has ended
-                self.processing_state.wait_if_batch_ending();
-                
-                // then set batch ending
-                self.processing_state.set_batch_ending();
-                
-                true // this is the end of a batch
-            } else {
-                false
-            }
-        };
-        
-        if !batch_ending_signifier {
-            // normal data must wait if the batch is ending
-            self.processing_state.wait_if_batch_ending();
+        if data.is_some() {
+            // count normal inputs
+            let mut in_count = self.processing_state.in_count.write().unwrap();
+            *in_count += 1;
         }
         
-        let output = {
-            // only perform the transformation is Some(data) was provided
-            match data {
-                None => {
-                    None
-                },
-                Some(inner_data) => {
-                    // count normal inputs
-                    let mut in_count = self.processing_state.in_count.write().unwrap();
-                    *in_count += 1;
-
-                    Some((self.inner_transform)(inner_data))
-                },
-            }
-        };
-        
-        let connectors = self.out_connectors.read().unwrap();
-        
-        if connectors.len() == 1 {
-            // only one connector: so it can be given the transformed value without cloning
-            connectors.first().unwrap().process(output)
-        } else {
-            for connector in connectors.iter() {
-                // give each connector a clone of the output
-                connector.process(output.clone());
-            }    
-        }
-        
-        if batch_ending_signifier {
-            self.processing_state.set_batch_ended();
-        } else {
-            // count normal outputs only
-            let mut out_count = self.processing_state.out_count.write().unwrap();
-            *out_count += 1;
-        }
+        self.pipe_processor.process_with_callback(data, &self);
     }
     
     fn has_work_remaining(&self) -> bool {
@@ -986,6 +1086,7 @@ mod tests {
         println!("starting");
         // create a Pipe
         let double_pipe = Arc::new(RwLock::new(Pipe::new(double)));
+        let filter_pipe = Arc::new(RwLock::new(Pipe::<i64,i64>::filter(|x:i64| { x >= 40 })));
         let triple_pipe = Arc::new(RwLock::new(Pipe::new(triple)));
         let second_double_pipe = Arc::new(RwLock::new(Pipe::new(double)));
         
@@ -1005,8 +1106,8 @@ mod tests {
                 result
                })));
         
-        let val:i64 = 50;
-        
+        let val:i64 = 55;
+        let connector0 = Connector::<i64>::sync_connector(filter_pipe.clone());
         let connector1 = Connector::<i64>::sync_connector(triple_pipe.clone());
         let connector2 = Connector::<i64>::async_connector(second_double_pipe.clone(), 4);
         let connector3 = Connector::<i64>::sync_connector(other_pipe.clone());
@@ -1014,7 +1115,8 @@ mod tests {
         let queue_connector = Connector::<TestResult>::queue_connector();
         
         // connect the pipes
-        double_pipe.write().unwrap().connect(connector1);
+        double_pipe.write().unwrap().connect(connector0);
+        filter_pipe.write().unwrap().connect(connector1);
         triple_pipe.write().unwrap().connect(connector2);
         second_double_pipe.write().unwrap().connect(connector3);
         //triple_pipe.write().unwrap().connect(branch_connector);
@@ -1024,7 +1126,7 @@ mod tests {
         double_pipe.write().unwrap().process(Some(50));
         double_pipe.write().unwrap().process(Some(36));
         
-        for i in 0..3 {
+        for i in 0..2 {
             let last_pipe = other_pipe.read().unwrap();
             let last_connectors = last_pipe.out_connectors.read().unwrap();
             let last_connector = last_connectors.first().unwrap();
