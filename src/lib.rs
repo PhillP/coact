@@ -91,7 +91,6 @@ pub struct FlatMapper<I,O: 'static, T> where T: Fn(I) -> O, O: Clone  {
     _marker: PhantomData<I>  
 }
 
-
 // Filter
 
 // Mapper
@@ -371,6 +370,28 @@ impl<I: 'static + Send, O: 'static> Pipe<I, O> where I: Clone, O: Clone {
         }
     }
     
+    pub fn stub() -> Pipe<I, O> {
+        Pipe::<I,O> {
+            out_connectors: Arc::new(RwLock::new(Vec::new())),
+            pipe_processor: Arc::new(StubPipeProcessor::<I,O>::new()),
+            processing_state: Arc::new(ProcessingState::new()),
+            _marker: PhantomData
+        }
+    }
+        
+    pub fn set_pipe_processor(&mut self, pipe_processor:Arc<PipeProcessor<I,O>>) {
+        self.pipe_processor = pipe_processor;
+    }
+    
+    pub fn flatmap<FlatMapFunction: 'static>(flatmap_function: FlatMapFunction) -> Pipe<I, O> where FlatMapFunction: Fn(I) -> Box<Iterator<Item=O>> {
+        Pipe::<I,O> {
+            out_connectors: Arc::new(RwLock::new(Vec::new())),
+            pipe_processor: Arc::new(FlatMapPipeProcessor::<I,O,FlatMapFunction>::new(flatmap_function)),
+            processing_state: Arc::new(ProcessingState::new()),
+            _marker: PhantomData
+        }
+    }
+    
     pub fn new_with_connector<Transform: 'static>(transform: Transform, connector: Connector<O>) -> Pipe<I, O> where Transform: Fn(I) -> O {
         let new_pipe = Pipe::<I, O>::new(transform);
         
@@ -483,6 +504,30 @@ impl<TIn: 'static + Send, TOut: 'static, Transform> PipeProcessor<TIn, TOut> for
     }
 }
 
+pub struct StubPipeProcessor<TIn, TOut> {
+    _marker1: PhantomData<TIn>,
+    _marker2: PhantomData<TOut>
+}
+
+impl<TIn: 'static + Send, TOut: 'static> StubPipeProcessor<TIn, TOut>
+    where   TIn: Clone  {
+        
+    pub fn new() -> StubPipeProcessor<TIn, TOut> {
+        StubPipeProcessor {
+            _marker1: PhantomData,
+            _marker2: PhantomData
+        }
+    }
+}
+
+impl<TIn: 'static + Send, TOut: 'static> PipeProcessor<TIn, TOut> for StubPipeProcessor<TIn, TOut>  
+    where   TIn: Clone  {
+ 
+    fn process_with_callback(&self, input: Option<TIn>, pipe: &Pipe<TIn,TOut>) -> () {
+        panic!("StubPipeProcessor should be used only as a placeholder during construction but was used for processing.");
+    }
+}
+
 pub struct FilterPipeProcessor<TIn, Filter> 
     where   Filter: Fn(TIn) -> bool, TIn: Clone  {
     inner_filter: Filter,
@@ -521,6 +566,187 @@ impl<TIn: 'static + Send, Filter> PipeProcessor<TIn, TIn> for FilterPipeProcesso
        if pass_value {
            pipe.process_out(input_clone);
        }
+    }
+}
+
+pub struct ItemCache<TItem> where TItem: Clone {
+    items: RwLock<Vec<Option<TItem>>>,
+    is_empty: Mutex<bool>,
+    empty_lock: Condvar
+}
+
+impl<TItem: 'static> ItemCache<TItem> where TItem: Clone {
+    fn new() -> ItemCache<TItem> {
+        ItemCache {
+            items: RwLock::new(Vec::new()),
+            is_empty: Mutex::new(true),
+            empty_lock: Condvar::new()
+        }
+    }
+
+    fn push(&self, item: Option<TItem>) {
+        // determine if currently empty_lock
+        let was_empty = { *(self.is_empty.lock().unwrap()) };
+        
+        let lock = self.items.write();
+        lock.unwrap().push(item);
+        
+        if was_empty {
+           let mut is_empty = self.is_empty.lock().unwrap();
+           *is_empty = false;
+           
+           self.empty_lock.notify_all();     
+        }
+    }    
+}
+
+pub struct ItemIterator<TItem> where TItem: Clone {
+    item_cache: Arc<ItemCache<TItem>>
+}
+
+impl<TItem> ItemIterator<TItem> where TItem: Clone {
+    pub fn new(item_cache: Arc<ItemCache<TItem>>) -> ItemIterator<TItem> {
+        ItemIterator {
+            item_cache: item_cache
+        }
+    }
+}
+
+impl<TItem> Iterator for ItemIterator<TItem> where TItem: Clone {
+    type Item = TItem;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut is_empty = self.item_cache.is_empty.lock().unwrap();
+        let mut item : Option<TItem> = None;
+        
+        while *is_empty {
+            is_empty = self.item_cache.empty_lock.wait(is_empty).unwrap();
+            
+            if !*is_empty {
+                item = self.item_cache.items.write().unwrap().remove(0);
+            }
+        }
+        
+        item
+    }
+}
+
+impl<TItem> Iterator for ItemCache<TItem> where TItem: Clone {
+    type Item = TItem;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut is_empty = self.is_empty.lock().unwrap();
+        let mut item : Option<TItem> = None;
+        
+        while *is_empty {
+            is_empty = self.empty_lock.wait(is_empty).unwrap();
+            
+            if !*is_empty {
+                item = self.items.write().unwrap().remove(0);
+            }
+        }
+        
+        item
+    }
+}
+
+pub struct IteratorPipeProcessor<TIn, TOut>
+    where TIn: Clone, TOut: Clone  {
+    item_cache: Arc<ItemCache<TIn>>,
+    _marker1: PhantomData<TIn>,
+    _marker2: PhantomData<TOut>
+}
+
+impl<TIn: 'static, TOut: 'static> IteratorPipeProcessor<TIn, TOut>
+    where TIn: Clone + Sync + Send, TOut: Clone  {
+    
+    pub fn new<IterFunction, TIterator>(iter_function: IterFunction, pipe: Arc<RwLock<Pipe<TIn,TOut>>> ) -> IteratorPipeProcessor<TIn, TOut>
+        where
+            TIterator: Iterator<Item=TOut>,
+            IterFunction: Fn(ItemIterator<TIn>) -> TIterator, IterFunction: 'static + Send {
+        
+        // need work here
+        let item_cache:Arc<ItemCache<TIn>> = Arc::new(ItemCache::new());
+        
+        // spawn a thread to perform work in coordination with the main thread
+        let item_cache_clone = item_cache.clone();
+        
+        let pipe_clone = pipe.clone();
+        
+        thread::spawn(move || {
+            loop {
+                // create a new iterator
+                let item_iterator = ItemIterator::new(item_cache_clone.clone());
+                
+                //let gen_iter = Arc::try_unwrap(iter_function(item_iterator)).ok().unwrap();
+                let gen_iter = iter_function(item_iterator);
+            
+                // iterate until end of batch
+                for i in gen_iter {
+                    pipe.read().unwrap().process_out(Some(i));  
+                }
+                
+                // signify end of batch
+                pipe_clone.read().unwrap().process_out(None);
+            }
+         });
+        
+        IteratorPipeProcessor {
+            item_cache: item_cache,
+            _marker1: PhantomData,
+            _marker2: PhantomData
+        }
+    }
+}
+
+impl<TIn: 'static + Send, TOut: 'static> PipeProcessor<TIn, TOut> for IteratorPipeProcessor<TIn, TOut> 
+    where TIn: Clone, TOut: Clone  {
+ 
+    fn process_with_callback(&self, input: Option<TIn>, pipe: &Pipe<TIn,TOut>) -> () {
+        // push the input into the ItemCache where it will be consumed through the iterator
+        self.item_cache.push(input);
+    }
+}
+
+pub struct FlatMapPipeProcessor<TIn, TOut, FlatMapFunction> 
+    where   FlatMapFunction: Fn(TIn) -> Box<Iterator<Item=TOut>>, TIn: Clone, TOut: Clone  {
+    flatmap_function: FlatMapFunction,
+    _marker1: PhantomData<TIn>,
+    _marker2: PhantomData<TOut>
+}
+
+impl<TIn: 'static + Send, TOut: 'static, FlatMapFunction: 'static> FlatMapPipeProcessor<TIn, TOut, FlatMapFunction>
+    where   FlatMapFunction: Fn(TIn) -> Box<Iterator<Item=TOut>>, TIn: Clone, TOut: Clone {
+
+    pub fn new(flatmap_function: FlatMapFunction) -> FlatMapPipeProcessor<TIn, TOut, FlatMapFunction> {
+        FlatMapPipeProcessor {
+            flatmap_function: flatmap_function,
+            _marker1: PhantomData,
+            _marker2: PhantomData
+        }
+    }
+}
+ 
+impl<TIn: 'static + Send, TOut: 'static, FlatMapFunction> PipeProcessor<TIn, TOut> for FlatMapPipeProcessor<TIn, TOut, FlatMapFunction> 
+    where   FlatMapFunction: Fn(TIn) -> Box<Iterator<Item=TOut>>, TIn: Clone, TOut: Clone  {
+ 
+    fn process_with_callback(&self, input: Option<TIn>, pipe: &Pipe<TIn,TOut>) -> () {
+        
+        let input_clone = input.clone();
+        
+        match input {
+            None => {
+                pipe.process_out(None);
+            },
+            Some(inner_data) => {
+                // call flatmap function
+                let iterator = (self.flatmap_function)(inner_data);
+                
+                for data in iterator {
+                    pipe.process_out(Some(data));
+                }
+            },
+        };
     }
 }
 
@@ -1126,19 +1352,107 @@ mod tests {
         double_pipe.write().unwrap().process(Some(50));
         double_pipe.write().unwrap().process(Some(36));
         
-        for i in 0..2 {
-            let last_pipe = other_pipe.read().unwrap();
+        let pipeline = Pipeline::new(double_pipe, other_pipe);
+        
+        pipeline.process(val);
+        pipeline.process(50);
+        pipeline.process(36);
+        
+        pipeline.flush_and_wait(StdDuration::from_millis(10000));
+                
+        for i in 0..1 {
+            let last_pipe = pipeline.pipe_out.read().unwrap();
             let last_connectors = last_pipe.out_connectors.read().unwrap();
             let last_connector = last_connectors.first().unwrap();
+            
             let result = last_connector.receive();
             if result.is_ok() {
              println!("In final loop {}.. result is {}", i, result.ok().unwrap().result);
             }
         }
         
-        let completed = double_pipe.write().unwrap().wait_work_complete(Duration::milliseconds(10000));
+        //let completed = double_pipe.write().unwrap().wait_work_complete(Duration::milliseconds(10000));
         
-        println!("Work completed {}", completed);
+        //println!("Work completed {}", completed);
+    }
+    
+    #[test]
+    fn pipe_with_iterators() {
+        println!("starting");
+        // create a Pipe
+        let double_pipe = Arc::new(RwLock::new(Pipe::new(double)));
+        let filter_pipe = Arc::new(RwLock::new(Pipe::<i64,i64>::stub()));
+        
+        let iter_processor = Arc::new(IteratorPipeProcessor::new(|iter:ItemIterator<i64>| {
+            iter.filter(|n:&i64| {*n>=40})
+            
+            //let f = iter.filter(|n:&i64| {*n>=40});
+            //Arc::new(f)
+            //Arc::new(f)
+        } ,filter_pipe.clone()));
+    
+        //pub fn new<IterFunction>(iter_function: IterFunction, pipe: &'static Pipe<TIn,TOut> ) -> IteratorPipeProcessor<TIn, TOut>
+        //where IterFunction: Fn(Arc<Iterator<Item=TIn>>) -> Box<Iterator<Item=TOut>>, IterFunction: 'static + Send {
+      
+        filter_pipe.write().unwrap().set_pipe_processor(iter_processor);
+        
+        let triple_pipe = Arc::new(RwLock::new(Pipe::new(triple)));
+        let second_double_pipe = Arc::new(RwLock::new(Pipe::new(double)));
+        
+        let other_pipe = Arc::new(RwLock::new(Pipe::new(|x:i64| { 
+                let result = x*10;
+                println!("Result is {}", result);
+                sleep(StdDuration::from_millis(2000));
+                TestResult {
+                    depth: 0,
+                    result: result
+                }
+               })));
+               
+        let branch_pipe = Arc::new(RwLock::new(Pipe::new(|x:i64| { 
+                let result = x*5;
+                println!("Result  on branch is {}", result);
+                result
+               })));
+        
+        let val:i64 = 55;
+        let connector0 = Connector::<i64>::sync_connector(filter_pipe.clone());
+        let connector1 = Connector::<i64>::sync_connector(triple_pipe.clone());
+        let connector2 = Connector::<i64>::async_connector(second_double_pipe.clone(), 4);
+        let connector3 = Connector::<i64>::sync_connector(other_pipe.clone());
+        let branch_connector = Connector::<i64>::async_connector(branch_pipe.clone(), 2);
+        let queue_connector = Connector::<TestResult>::queue_connector();
+        
+        // connect the pipes
+        double_pipe.write().unwrap().connect(connector0);
+        filter_pipe.write().unwrap().connect(connector1);
+        triple_pipe.write().unwrap().connect(connector2);
+        second_double_pipe.write().unwrap().connect(connector3);
+        //triple_pipe.write().unwrap().connect(branch_connector);
+        other_pipe.write().unwrap().connect(queue_connector);
+                
+        let pipeline = Pipeline::new(double_pipe, other_pipe);
+        pipeline.process(val);
+        pipeline.process(50);
+        pipeline.process(36);
+        
+        pipeline.flush_and_wait(StdDuration::from_millis(10000));
+               
+        for i in 0..1 {
+            let last_pipe = pipeline.pipe_out.read().unwrap();
+            let last_connectors = last_pipe.out_connectors.read().unwrap();
+            let last_connector = last_connectors.first().unwrap();
+            
+            let result = last_connector.receive();
+            
+            if result.is_ok() {
+             println!("In final loop {}.. result is {}", i, result.ok().unwrap().result);
+            }
+        }
+        
+        //let completed = double_pipe.write().unwrap().wait_work_complete(Duration::milliseconds(10000));
+        
+        //println!("Work completed {}", completed);
     }
     
     #[test]
