@@ -378,6 +378,20 @@ impl<I: 'static + Send, O: 'static> Pipe<I, O> where I: Clone, O: Clone {
             _marker: PhantomData
         }
     }
+    
+    pub fn iter<IterFunction, TIterator>(iter_function: IterFunction) -> Arc<RwLock<Pipe<I, O>>>
+        where
+            TIterator: Iterator<Item=O>,
+            IterFunction: Fn(ItemIterator<I>) -> TIterator, IterFunction: 'static + Send,
+            I: Sync {
+        
+            let pipe = Arc::new(RwLock::new(Pipe::stub()));
+            
+            let pipe_processor = Arc::new(IteratorPipeProcessor::new(iter_function, pipe.clone()));
+            pipe.write().unwrap().set_pipe_processor(pipe_processor);
+            
+            pipe
+        }
         
     pub fn set_pipe_processor(&mut self, pipe_processor:Arc<PipeProcessor<I,O>>) {
         self.pipe_processor = pipe_processor;
@@ -585,18 +599,48 @@ impl<TItem: 'static> ItemCache<TItem> where TItem: Clone {
     }
 
     fn push(&self, item: Option<TItem>) {
-        // determine if currently empty_lock
-        let was_empty = { *(self.is_empty.lock().unwrap()) };
         
-        let lock = self.items.write();
-        lock.unwrap().push(item);
+        if item.is_none() {
+            println!("pushing None");
+        } else {
+            println!("pushing Some");
+        }
         
-        if was_empty {
+        let mut lock = self.items.write().unwrap();
+        lock.push(item);
+        
+        if lock.len() == 1 {
            let mut is_empty = self.is_empty.lock().unwrap();
            *is_empty = false;
            
-           self.empty_lock.notify_all();     
+           self.empty_lock.notify_all(); 
         }
+    }
+    
+    fn remove(&self) -> Option<TItem> {
+        let mut is_empty = self.is_empty.lock().unwrap();
+        let mut item : Option<TItem> = None;
+        let mut got_item = false;
+        
+        while !got_item {
+            if *is_empty {
+                println!("is empty");
+                is_empty = self.empty_lock.wait(is_empty).unwrap();
+            } else {
+                println!("getting item");
+                let mut lock = self.items.write().unwrap();
+                item = lock.remove(0);
+        
+                if lock.len() == 0 {
+                    println!("removed last");
+                    *is_empty = true;
+                    self.empty_lock.notify_all(); 
+                }
+                got_item = true;
+            }
+        }
+
+        item
     }    
 }
 
@@ -612,22 +656,11 @@ impl<TItem> ItemIterator<TItem> where TItem: Clone {
     }
 }
 
-impl<TItem> Iterator for ItemIterator<TItem> where TItem: Clone {
+impl<TItem: 'static> Iterator for ItemIterator<TItem> where TItem: Clone {
     type Item = TItem;
     
     fn next(&mut self) -> Option<Self::Item> {
-        let mut is_empty = self.item_cache.is_empty.lock().unwrap();
-        let mut item : Option<TItem> = None;
-        
-        while *is_empty {
-            is_empty = self.item_cache.empty_lock.wait(is_empty).unwrap();
-            
-            if !*is_empty {
-                item = self.item_cache.items.write().unwrap().remove(0);
-            }
-        }
-        
-        item
+        self.item_cache.remove()
     }
 }
 
@@ -635,6 +668,8 @@ impl<TItem> Iterator for ItemCache<TItem> where TItem: Clone {
     type Item = TItem;
     
     fn next(&mut self) -> Option<Self::Item> {
+        panic!("not supported");
+        /*
         let mut is_empty = self.is_empty.lock().unwrap();
         let mut item : Option<TItem> = None;
         
@@ -647,6 +682,8 @@ impl<TItem> Iterator for ItemCache<TItem> where TItem: Clone {
         }
         
         item
+        */
+        None
     }
 }
 
@@ -679,13 +716,33 @@ impl<TIn: 'static, TOut: 'static> IteratorPipeProcessor<TIn, TOut>
                 let item_iterator = ItemIterator::new(item_cache_clone.clone());
                 
                 //let gen_iter = Arc::try_unwrap(iter_function(item_iterator)).ok().unwrap();
-                let gen_iter = iter_function(item_iterator);
+                let mut gen_iter = iter_function(item_iterator);
             
                 // iterate until end of batch
-                for i in gen_iter {
-                    pipe.read().unwrap().process_out(Some(i));  
+                loop {
+                    println!("iteration");
+                    match gen_iter.next() {
+                        Some(x) => {
+                            println!("got value");
+                            pipe.read().unwrap().process_out(Some(x));
+                        },
+                        
+                        None => {
+                            println!("got none"); 
+                            break 
+                            }
+                    }
                 }
                 
+                /*
+                for i in gen_iter {
+                    println!("iteration");
+                
+                    pipe.read().unwrap().process_out(Some(i));  
+                }
+                */
+                
+                println!("end of batch");
                 // signify end of batch
                 pipe_clone.read().unwrap().process_out(None);
             }
@@ -1201,9 +1258,16 @@ impl<T1,T2> SenderReceiverPair<T1, T2> {
 /// Indicates the `SenderReceiverPair<T1, T2>` is safe for Sync (multi-threaded) operations
 unsafe impl<T1, T2> Sync for SenderReceiverPair<T1, T2>  {}
 
+
 macro_rules! connector {
     
     ( $threads:expr, sync $nexty:ty => $next:ident ) => {
+        {
+            Connector::<$nexty>::sync_connector($next.clone())
+        }
+    };
+    
+    ( $threads:expr, iter $nexty:ty => $next:ident ) => {
         {
             Connector::<$nexty>::sync_connector($next.clone())
         }
@@ -1214,20 +1278,52 @@ macro_rules! connector {
             Connector::<$nexty>::async_connector($next.clone(), $threads)
         }
     };
-    
 }
 
 macro_rules! connect {
+    ( pipe => sync $next:expr ) => {
+        {
+            {
+                Arc::new(RwLock::new(Pipe::new($next)))
+            }
+        }
+    };
+    
+    ( pipe => async $next:expr ) => {
+        {
+            {
+                Arc::new(RwLock::new(Pipe::new($next)))
+            }
+        }
+    };
+    
+    ( pipe => iter $next:expr ) => {
+        {
+            {
+                Pipe::iter($next)
+            }
+        }
+    };
+    
+    ( single => $threads:expr, $last:ident, $mode:tt $nexty:ty => $next:expr ) => {
+        {
+            let nextpipe = connect!(pipe => $mode $next);
+            let connector = connector!($threads, $mode $nexty => nextpipe);
+            
+            $last.write().unwrap().connect(connector);
+            nextpipe.clone()
+        }
+    };
+    
     ( $threads:expr, $last:ident, $($mode:tt $nexty:ty => $next:expr ),* ) => {
         {
+            let last_pipe = $last.clone();
+                    
             $(
-                let next = Arc::new(RwLock::new(Pipe::new($next)));
-            
-                let connector = connector!($threads, $mode $nexty => next);
-                
-                $last.write().unwrap().connect(connector);
-                let $last = next.clone();
+                let last_pipe = connect!(single => $threads, last_pipe, $mode $nexty => $next);
             )*
+            
+            last_pipe
         }
     };
 }
@@ -1238,7 +1334,7 @@ macro_rules! pipeline {
             let pipe = Arc::new(RwLock::new(Pipe::new($head)));
             let last = pipe.clone();
             
-            connect!($threads, last, $($mode $nexty => $next),*);
+            let last = connect!($threads, last, $($mode $nexty => $next),*);
             
             Pipeline::new(pipe, last.clone())
         }
@@ -1250,7 +1346,27 @@ macro_rules! pipeline {
         }
     };
 }
-   
+
+/*
+fn pipe_macro_expand() {
+        let pipeline = pipeline!(async_connector_threads: 8,
+                            i64 => |x:i64|{x*2},
+                            sync i64 => |x:i64|{x*10},
+                            //iter i64 => |iter| { iter.filter(|n| {*n>=40}) },
+                            sync i64 => |x:i64|{x+2},
+                            async i64 => |x:i64| { 
+                                let result = x*9;
+                                println!("pipe_macro Result is {}", result);
+                                TestResult {
+                                    depth: 0,
+                                    result: result
+                                }
+                            }
+                            => TestResult
+                            );
+}
+*/
+  
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1263,12 +1379,12 @@ mod tests {
     
     
     fn double(i:i64) -> i64 {
-        println!("double");
-        format!("Value before double is: {}",i);
+        //println!("double");
+        //format!("Value before double is: {}",i);
         i*2
     }
     fn triple(i:i64) -> i64 {
-        println!("triple");
+        //println!("triple");
         format!("Value before triple is: {}",i);
         i*3
     }
@@ -1282,12 +1398,16 @@ mod tests {
     #[test]
     fn pipe_macro() {
         let pipeline = pipeline!(async_connector_threads: 8,
-                            i64 => |x:i64|{x*2},
-                            sync i64 => |x:i64|{x*10},
-                            sync i64 => |x:i64|{x+2},
+                            i64 => |x:i64| {x*2},
+                            sync i64 => |x:i64| {x*10},
+                            iter i64 => |iter| { 
+                                println!("creating iterator.");
+                                iter.filter(|n| {*n>40} ) 
+                            },
+                            sync i64 => |x:i64| {x+2},
                             async i64 => |x:i64| { 
-                                let result = x*10;
-                                println!("Result is {}", result);
+                                let result = x*9;
+                                println!("pipe_macro Result is {}", result);
                                 TestResult {
                                     depth: 0,
                                     result: result
@@ -1296,7 +1416,14 @@ mod tests {
                             => TestResult
                             );
                           
+       pipeline.process(2);
+       pipeline.process(2);
+       pipeline.process(2);
+       pipeline.process(2);
        pipeline.process(5);
+       pipeline.process(6);
+       pipeline.process(1);
+       
        println!("Flush and wait....");
                                 
        pipeline.flush_and_wait(StdDuration::from_millis(10000));
@@ -1318,7 +1445,7 @@ mod tests {
         
         let other_pipe = Arc::new(RwLock::new(Pipe::new(|x:i64| { 
                 let result = x*10;
-                println!("Result is {}", result);
+                //println!("Result is {}", result);
                 sleep(StdDuration::from_millis(2000));
                 TestResult {
                     depth: 0,
@@ -1328,7 +1455,7 @@ mod tests {
                
         let branch_pipe = Arc::new(RwLock::new(Pipe::new(|x:i64| { 
                 let result = x*5;
-                println!("Result  on branch is {}", result);
+                //println!("Result  on branch is {}", result);
                 result
                })));
         
@@ -1383,17 +1510,8 @@ mod tests {
         let double_pipe = Arc::new(RwLock::new(Pipe::new(double)));
         let filter_pipe = Arc::new(RwLock::new(Pipe::<i64,i64>::stub()));
         
-        let iter_processor = Arc::new(IteratorPipeProcessor::new(|iter:ItemIterator<i64>| {
-            iter.filter(|n:&i64| {*n>=40})
-            
-            //let f = iter.filter(|n:&i64| {*n>=40});
-            //Arc::new(f)
-            //Arc::new(f)
-        } ,filter_pipe.clone()));
-    
-        //pub fn new<IterFunction>(iter_function: IterFunction, pipe: &'static Pipe<TIn,TOut> ) -> IteratorPipeProcessor<TIn, TOut>
-        //where IterFunction: Fn(Arc<Iterator<Item=TIn>>) -> Box<Iterator<Item=TOut>>, IterFunction: 'static + Send {
-      
+        let iter_processor = Arc::new(IteratorPipeProcessor::new(|iter| { iter.filter(|n:&i64| {*n>=40}) } ,filter_pipe.clone()));
+          
         filter_pipe.write().unwrap().set_pipe_processor(iter_processor);
         
         let triple_pipe = Arc::new(RwLock::new(Pipe::new(triple)));
@@ -1401,7 +1519,7 @@ mod tests {
         
         let other_pipe = Arc::new(RwLock::new(Pipe::new(|x:i64| { 
                 let result = x*10;
-                println!("Result is {}", result);
+                //println!("Result is {}", result);
                 sleep(StdDuration::from_millis(2000));
                 TestResult {
                     depth: 0,
@@ -1411,7 +1529,7 @@ mod tests {
                
         let branch_pipe = Arc::new(RwLock::new(Pipe::new(|x:i64| { 
                 let result = x*5;
-                println!("Result  on branch is {}", result);
+                //println!("Result  on branch is {}", result);
                 result
                })));
         
