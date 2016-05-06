@@ -392,6 +392,19 @@ impl<I: 'static + Send, O: 'static> Pipe<I, O> where I: Clone, O: Clone {
             
             pipe
         }
+
+    pub fn consumer<ConsumerFunction>(consumer_function: ConsumerFunction) -> Arc<RwLock<Pipe<I, O>>>
+        where
+            ConsumerFunction: Fn(ItemIterator<I>) -> O, ConsumerFunction: 'static + Send,
+            I: Sync {
+        
+            let pipe = Arc::new(RwLock::new(Pipe::stub()));
+            
+            let pipe_processor = Arc::new(ConsumerPipeProcessor::new(consumer_function, pipe.clone()));
+            pipe.write().unwrap().set_pipe_processor(pipe_processor);
+            
+            pipe
+        }
         
     pub fn set_pipe_processor(&mut self, pipe_processor:Arc<PipeProcessor<I,O>>) {
         self.pipe_processor = pipe_processor;
@@ -687,6 +700,57 @@ impl<TItem> Iterator for ItemCache<TItem> where TItem: Clone {
     }
 }
 
+pub struct ConsumerPipeProcessor<TIn, TOut>
+    where TIn: Clone, TOut: Clone  {
+    item_cache: Arc<ItemCache<TIn>>,
+    _marker1: PhantomData<TIn>,
+    _marker2: PhantomData<TOut>
+}
+
+impl<TIn: 'static, TOut: 'static> ConsumerPipeProcessor<TIn, TOut>
+    where TIn: Clone + Sync + Send, TOut: Clone  {
+    
+    pub fn new<ConsumerFunction>(consumer_function: ConsumerFunction, pipe: Arc<RwLock<Pipe<TIn,TOut>>>) -> ConsumerPipeProcessor<TIn, TOut>
+        where
+            ConsumerFunction: Fn(ItemIterator<TIn>) -> TOut, ConsumerFunction: 'static + Send {
+        
+        let item_cache:Arc<ItemCache<TIn>> = Arc::new(ItemCache::new());
+        
+        // spawn a thread to perform work in coordination with the main thread
+        let item_cache_clone = item_cache.clone();
+        
+        let pipe_clone = pipe.clone();
+        
+        thread::spawn(move || {
+            loop {
+                // create a new iterator
+                let item_iterator = ItemIterator::new(item_cache_clone.clone());
+                
+                let value = consumer_function(item_iterator);
+                
+                pipe_clone.read().unwrap().process_out(Some(value));
+                // signify end of batch
+                pipe_clone.read().unwrap().process_out(None);
+            }
+         });
+        
+        ConsumerPipeProcessor {
+            item_cache: item_cache,
+            _marker1: PhantomData,
+            _marker2: PhantomData
+        }
+    }
+}
+
+impl<TIn: 'static + Send, TOut: 'static> PipeProcessor<TIn, TOut> for ConsumerPipeProcessor<TIn, TOut> 
+    where TIn: Clone, TOut: Clone  {
+ 
+    fn process_with_callback(&self, input: Option<TIn>, pipe: &Pipe<TIn,TOut>) -> () {
+        // push the input into the ItemCache where it will be consumed through the iterator
+        self.item_cache.push(input);
+    }
+}
+
 pub struct IteratorPipeProcessor<TIn, TOut>
     where TIn: Clone, TOut: Clone  {
     item_cache: Arc<ItemCache<TIn>>,
@@ -719,30 +783,10 @@ impl<TIn: 'static, TOut: 'static> IteratorPipeProcessor<TIn, TOut>
                 let mut gen_iter = iter_function(item_iterator);
             
                 // iterate until end of batch
-                loop {
-                    println!("iteration");
-                    match gen_iter.next() {
-                        Some(x) => {
-                            println!("got value");
-                            pipe.read().unwrap().process_out(Some(x));
-                        },
-                        
-                        None => {
-                            println!("got none"); 
-                            break 
-                            }
-                    }
+                for item in gen_iter {
+                    pipe.read().unwrap().process_out(Some(item));
                 }
                 
-                /*
-                for i in gen_iter {
-                    println!("iteration");
-                
-                    pipe.read().unwrap().process_out(Some(i));  
-                }
-                */
-                
-                println!("end of batch");
                 // signify end of batch
                 pipe_clone.read().unwrap().process_out(None);
             }
@@ -1273,6 +1317,12 @@ macro_rules! connector {
         }
     };
     
+    ( $threads:expr, consumer $nexty:ty => $next:ident ) => {
+        {
+            Connector::<$nexty>::sync_connector($next.clone())
+        }
+    };
+    
     ( $threads:expr, async $nexty:ty => $next:ident ) => {
         {
             Connector::<$nexty>::async_connector($next.clone(), $threads)
@@ -1301,6 +1351,14 @@ macro_rules! connect {
         {
             {
                 Pipe::iter($next)
+            }
+        }
+    };
+    
+    ( pipe => consumer $next:expr ) => {
+        {
+            {
+                Pipe::consumer($next)
             }
         }
     };
@@ -1404,9 +1462,9 @@ mod tests {
                                 println!("creating iterator.");
                                 iter.filter(|n| {*n>40} ) 
                             },
-                            sync i64 => |x:i64| {x+2},
+                            consumer i64 => |iter| { iter.max().unwrap() },
                             async i64 => |x:i64| { 
-                                let result = x*9;
+                                let result = x*2;
                                 println!("pipe_macro Result is {}", result);
                                 TestResult {
                                     depth: 0,
@@ -1420,6 +1478,7 @@ mod tests {
        pipeline.process(2);
        pipeline.process(2);
        pipeline.process(2);
+       pipeline.process(8);
        pipeline.process(5);
        pipeline.process(6);
        pipeline.process(1);
