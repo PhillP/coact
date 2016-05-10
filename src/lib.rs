@@ -10,6 +10,8 @@ use std::marker::PhantomData;
 use core::ops::Deref;
 use time::{Duration, PreciseTime};
 use std::time::Duration as StdDuration;
+use std::collections::HashMap;
+use core::hash::Hash;
 
 pub struct Pipeline<TIn, TLastIn: 'static, TOut: 'static> where TOut: Clone  {
     pipe_in_connector: Arc<RwLock<Connector<TIn>>>,
@@ -61,6 +63,48 @@ pub struct ProcessingState  {
     out_count: RwLock<i64>,
 }
 
+#[derive(Clone)]
+pub struct GroupedData<T,GK> where T:Clone, GK:Clone {
+    grouping_key: GK,
+    data: T
+}
+
+unsafe impl<T,GK> Send for GroupedData<T,GK> {}
+
+impl<T: 'static,GK> GroupedData<T,GK> where T:Clone, GK:Clone {
+    pub fn new(group_key: GK, data: T) -> GroupedData<T,GK> {
+        GroupedData {
+            grouping_key: group_key,
+            data: data
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct GroupedIterator<T,GK> where T:Clone, GK:Clone {
+    grouping_key: GK,
+    data: Arc<ItemCache<T>>,
+    iterator: Arc<ItemIterator<T>>
+}
+
+unsafe impl<T,GK> Send for GroupedIterator<T,GK> {}
+
+impl<T: 'static,GK> GroupedIterator<T,GK> where T:Clone, GK:Clone {
+    pub fn new_with_first(grouping_key: GK, first: T) -> GroupedIterator<T,GK> {
+        let item_cache = Arc::new(ItemCache::new());
+        
+        let grouped_iterator = GroupedIterator {
+            grouping_key: grouping_key,
+            data: item_cache.clone(),
+            iterator: Arc::new(ItemIterator::new(item_cache.clone()))
+        };
+        
+        grouped_iterator.data.push(Some(first));
+        
+        grouped_iterator
+    }
+}
+
 pub struct Pipe<I,O> where O: Clone {
     out_connectors: Arc<RwLock<Vec<Connector<O>>>>,
     pipe_processor: Arc<PipeProcessor<I,O>>,
@@ -68,6 +112,7 @@ pub struct Pipe<I,O> where O: Clone {
     _marker: PhantomData<I>
 }
 
+/*
 pub struct Filter<I, T> where T: Fn(I) -> bool, I: Clone  {
     out_connectors: Arc<RwLock<Vec<Connector<I>>>>,
     filter_function: T,
@@ -100,6 +145,8 @@ pub struct FlatMapper<I,O: 'static, T> where T: Fn(I) -> O, O: Clone  {
 // Reducer
 
 // Collector
+
+*/
 
 unsafe impl<I,O> Send for Pipe<I,O> where O: Clone {}
 unsafe impl<I,O> Sync for Pipe<I,O> where O: Clone {}
@@ -677,27 +724,42 @@ impl<TItem: 'static> Iterator for ItemIterator<TItem> where TItem: Clone {
     }
 }
 
-impl<TItem> Iterator for ItemCache<TItem> where TItem: Clone {
-    type Item = TItem;
+pub struct GroupingPipeProcessor<TIn, TGroup>
+    where TIn: Clone, TGroup: Clone {
+    item_cache: Arc<ItemCache<TIn>>,
+    _marker1: PhantomData<TIn>,
+    _marker2: PhantomData<TGroup>
+}
+
+pub struct UngroupingPipeProcessor<TIn, TOut, TGroup>
+    where TIn: Clone, TOut: Clone, TGroup: Clone  {
+    _marker1: PhantomData<TIn>,
+    _marker2: PhantomData<TOut>,
+    _marker3: PhantomData<TGroup>
+}
+
+pub struct GroupReducerPipeProcessor<TInnerIn, TInnerOut, TGroup, ReducerFunction>
+    where TInnerIn: Clone, TInnerOut: Clone, TGroup: Clone, 
+    ReducerFunction: Fn(TGroup, Arc<ItemIterator<TInnerIn>>) -> TInnerOut, ReducerFunction: 'static + Send  {
     
-    fn next(&mut self) -> Option<Self::Item> {
-        panic!("not supported");
-        /*
-        let mut is_empty = self.is_empty.lock().unwrap();
-        let mut item : Option<TItem> = None;
-        
-        while *is_empty {
-            is_empty = self.empty_lock.wait(is_empty).unwrap();
-            
-            if !*is_empty {
-                item = self.items.write().unwrap().remove(0);
-            }
-        }
-        
-        item
-        */
-        None
-    }
+    reducer_function: ReducerFunction,
+    _marker1: PhantomData<TInnerIn>,
+    _marker2: PhantomData<TInnerOut>,
+    _marker3: PhantomData<TGroup>
+}
+
+pub struct GroupedMapPipeProcessor<TIn, TOut, TGroup>
+    where TIn: Clone, TOut: Clone, TGroup: Clone  {
+    _marker1: PhantomData<TIn>,
+    _marker2: PhantomData<TOut>,
+    _marker3: PhantomData<TGroup>
+}
+
+pub struct GroupIteratorPipeProcessor<TIn, TOut, TGroup>
+    where TIn: Clone, TOut: Clone  {
+    _marker1: PhantomData<TIn>,
+    _marker2: PhantomData<TOut>,
+    _marker3: PhantomData<TGroup>
 }
 
 pub struct ConsumerPipeProcessor<TIn, TOut>
@@ -705,6 +767,103 @@ pub struct ConsumerPipeProcessor<TIn, TOut>
     item_cache: Arc<ItemCache<TIn>>,
     _marker1: PhantomData<TIn>,
     _marker2: PhantomData<TOut>
+}
+
+impl<TIn: 'static + Send, TGroup: 'static> GroupingPipeProcessor<TIn, TGroup> 
+    where TIn: Clone + Sync + Copy, TGroup: Clone + Hash + Eq + PartialEq  {
+    
+    pub fn new<GroupingFunction>(grouping_function: GroupingFunction, pipe: Arc<RwLock<Pipe<TIn,Arc<GroupedIterator<TIn, TGroup>>>>>) -> GroupingPipeProcessor<TIn, TGroup>
+        where GroupingFunction: Fn(TIn) -> TGroup, GroupingFunction: 'static + Send {
+        
+        let item_cache:Arc<ItemCache<TIn>> = Arc::new(ItemCache::new());
+        
+        // spawn a thread to perform work in coordination with the main thread
+        let item_cache_clone = item_cache.clone();
+        
+        let pipe_clone = pipe.clone();
+        
+        thread::spawn(move || {
+            loop {
+                // create a HashMap
+                let mut group_map : HashMap<TGroup, Arc<GroupedIterator<TIn, TGroup>>> = HashMap::new();
+                
+                // create a new iterator
+                let item_iterator = ItemIterator::new(item_cache_clone.clone());
+                
+                for item in item_iterator {
+                    // determine the group
+                    let group = grouping_function(item);
+                    
+                    if (group_map.contains_key(&group)) {
+                        group_map.get(&group).unwrap().data.push(Some(item));
+                    } else {
+                        let grouped_iterator = Arc::new(GroupedIterator::new_with_first(group.clone(), item));
+                            group_map.insert(group, grouped_iterator.clone());
+                            
+                            // and output it for processing
+                            pipe_clone.read().unwrap().process_out(Some(grouped_iterator));
+                    }
+                }
+                
+                // signify end of batch
+                for (group, group_iter) in &group_map {
+                    // for each group
+                    group_iter.data.push(None);
+                }
+                // then overall
+                pipe_clone.read().unwrap().process_out(None);
+            }
+         });
+        
+        GroupingPipeProcessor {
+            item_cache: item_cache,
+            _marker1: PhantomData,
+            _marker2: PhantomData
+        }
+    }
+}
+
+impl<TIn: 'static + Send, TGroup: 'static> PipeProcessor<TIn, Arc<GroupedIterator<TIn, TGroup>>> for GroupingPipeProcessor<TIn, TGroup> 
+    where TIn: Clone, TGroup: Clone  {
+ 
+    fn process_with_callback(&self, input: Option<TIn>, pipe: &Pipe<TIn,Arc<GroupedIterator<TIn, TGroup>>>) -> () {
+        // push the input into the ItemCache where it will be consumed through the iterator
+        self.item_cache.push(input);
+    }
+}
+
+impl<TInnerIn: 'static + Send, TInnerOut: 'static + Send, TGroup: 'static, ReducerFunction> GroupReducerPipeProcessor<TInnerIn, TInnerOut, TGroup, ReducerFunction> 
+    where   TInnerIn: Clone + Sync + Copy, TInnerOut: 'static + Send + Clone, TGroup: Clone + Hash + Eq + PartialEq,  
+            ReducerFunction: Fn(TGroup, Arc<ItemIterator<TInnerIn>>) -> TInnerOut, ReducerFunction: 'static + Send {
+    pub fn new(reducer_function: ReducerFunction, pipe: Arc<RwLock<Pipe<GroupedIterator<TInnerIn, TGroup>, GroupedData<TInnerOut, TGroup>>>>) -> GroupReducerPipeProcessor<TInnerIn, TInnerOut, TGroup,ReducerFunction>
+         {
+        GroupReducerPipeProcessor {
+            reducer_function: reducer_function,
+            _marker1: PhantomData,
+            _marker2: PhantomData,
+            _marker3: PhantomData
+        }
+    }
+}
+
+impl<TInnerIn: 'static + Send, TInnerOut: 'static + Send, TGroup: 'static, ReducerFunction> PipeProcessor<GroupedIterator<TInnerIn,TGroup>,GroupedData<TInnerOut,TGroup>> for GroupReducerPipeProcessor<TInnerIn, TInnerOut, TGroup, ReducerFunction>
+    where   TInnerIn: Clone + Sync + Copy, TInnerOut: 'static + Send + Clone, TGroup: Clone + Hash + Eq + PartialEq,  
+            ReducerFunction: Fn(TGroup, Arc<ItemIterator<TInnerIn>>) -> TInnerOut, ReducerFunction: 'static + Send {
+    
+    fn process_with_callback(&self, input: Option<GroupedIterator<TInnerIn,TGroup>>, pipe: &Pipe<GroupedIterator<TInnerIn,TGroup>,GroupedData<TInnerOut,TGroup>>) -> () {
+        if input.is_some() {
+            
+            let unwrapped = input.unwrap();
+            
+            let grouping_key = unwrapped.clone().grouping_key;
+            let iterator = unwrapped.clone().iterator;
+            
+            let reduced_group = GroupedData::new(grouping_key.clone(), (self.reducer_function)(grouping_key.clone(),iterator));
+            pipe.process_out(Some(reduced_group));
+        } else {
+            pipe.process_out(None);    
+        }
+    }
 }
 
 impl<TIn: 'static, TOut: 'static> ConsumerPipeProcessor<TIn, TOut>
